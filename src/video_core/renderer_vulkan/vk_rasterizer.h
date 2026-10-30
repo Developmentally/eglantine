@@ -265,6 +265,7 @@ private:
     u64 mesh_scratch_next = 0;
     bool bias_vs_active = false;
     std::unordered_map<u64, u32> vs_dump_counts;
+    bool mesh_draw{}; ///< the draw being prepared uses a task/mesh pipeline
 };
 
 } // namespace Vulkan
