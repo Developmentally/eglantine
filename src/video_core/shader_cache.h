@@ -101,12 +101,16 @@ protected:
     std::array<const ShaderInfo*, NUM_PROGRAMS> shader_infos{};
     bool last_shaders_valid = false;
 
-private:
     /// @brief Tries to obtain a cached shader starting in a given address
     /// @note Doesn't check for ranges, the given address has to be the start of the shader
     /// @param addr Start address of the shader, this doesn't cache for region
     /// @return Pointer to a valid shader, nullptr when nothing is found
     ShaderInfo* TryGet(VAddr addr) const;
+
+    /// @brief Create a new shader entry and register it
+    const ShaderInfo* MakeShaderInfo(GenericEnvironment& env, VAddr cpu_addr);
+
+private:
 
     /// @brief Register in the cache a given entry
     /// @param data Shader to store in the cache
@@ -141,9 +145,6 @@ private:
     /// @brief Creates a new entry in the lookup cache and returns its pointer
     /// @pre lookup_mutex is locked
     Entry* NewEntry(VAddr addr, VAddr addr_end, ShaderInfo* data);
-
-    /// @brief Create a new shader entry and register it
-    const ShaderInfo* MakeShaderInfo(GenericEnvironment& env, VAddr cpu_addr);
 
     /// Rethrows the error a native program at this address was rejected with, if any.
     void RethrowIfRejected(VAddr addr);

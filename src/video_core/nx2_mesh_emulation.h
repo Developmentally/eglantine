@@ -126,7 +126,10 @@ struct ScratchPlan {
 
     static ScratchPlan For(const DrawDescription& draw) {
         // The MAP region fits 340 triangles; the hardware limit is what SET_MESH_SHADER_A says.
-        const u32 primitives = std::clamp<u32>(draw.mesh.max_primitives, 1, (Layout::MapBytes / 4 - 4) / 3);
+        // The title's mesh programs emit two triangles per lane, so never replay fewer than 64
+        // slots in case the register decode is off.
+        const u32 primitives = std::clamp<u32>(std::max<u32>(draw.mesh.max_primitives, 64), 1,
+                                               (Layout::MapBytes / 4 - 4) / 3);
         ScratchPlan plan{};
         plan.primitive_slots_shift = static_cast<u32>(std::bit_width(primitives - 1));
         plan.task_offset = ParamsBytes;
@@ -138,7 +141,9 @@ struct ScratchPlan {
     Layout::Params Params(GPUVAddr scratch, const DrawDescription& draw) const {
         return Layout::Params{
             .task_base = scratch + task_offset,
+            .task_bytes = mesh_offset - task_offset,
             .mesh_base = scratch + mesh_offset,
+            .mesh_bytes = bytes - mesh_offset,
             .primitive_slots_shift = primitive_slots_shift,
             // Per-primitive attribute groups follow the vertex groups: max_vertices rounded up
             // to 32-lane groups, each the size of one attribute group set. The generator only

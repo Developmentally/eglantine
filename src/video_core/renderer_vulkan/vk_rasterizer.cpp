@@ -21,12 +21,15 @@
 #include "video_core/nx2.h"
 #include "video_core/renderer_vulkan/renderer_vulkan.h"
 
+#include <unordered_set>
+#include "common/alignment.h"
 #include "common/assert.h"
 #include "common/string_util.h"
 #include "shader_recompiler/exception.h"
 #include "common/logging.h"
 #include "common/scope_exit.h"
 #include "common/settings.h"
+#include "core/hle/service/nvdrv/devices/nx2_gpu_memory.h"
 #include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/gpu_logging/gpu_logging.h"
 #include "video_core/control/channel_state.h"
@@ -297,6 +300,159 @@ bool RasterizerVulkan::ResetIndirectRecordsOnCpu(bool is_indexed) {
     return true;
 }
 
+bool RasterizerVulkan::DrawEmulatedMesh(const VideoCommon::Nx2MeshEmulation::DrawDescription& draw) {
+    namespace ME = VideoCommon::Nx2MeshEmulation;
+    using Layout = Shader::Ampere::MeshEmulation::Layout;
+    static u32 logged{};
+    const auto fail = [&](std::string_view reason) {
+        if (logged++ < 32) {
+            LOG_WARNING(HW_GPU, "Task/mesh emulation: {} (task {:#x} mesh {:#x} workgroups {})", reason,
+                        draw.task_program, draw.mesh_program, draw.workgroups);
+        }
+        return false;
+    };
+    if (mesh_scratch_size == 0) {
+        const auto scratch = Service::Nvidia::Devices::GetNx2MeshScratch();
+        if (scratch.size == 0) {
+            return fail("no scratch memory");
+        }
+        mesh_scratch_base = scratch.gpu_address;
+        mesh_scratch_size = scratch.size;
+    }
+    const Layout layout{};
+    const auto plan = ME::ScratchPlan::For(draw);
+    const u64 bytes = Common::AlignUp(plan.bytes, 0x1000);
+    if (bytes > mesh_scratch_size) {
+        return fail("draw larger than the scratch");
+    }
+    if (mesh_scratch_next + bytes > mesh_scratch_size) {
+        mesh_scratch_next = 0;
+    }
+    const GPUVAddr scratch = mesh_scratch_base + mesh_scratch_next;
+    if (!gpu_memory->IsFullyMappedRange(scratch, bytes)) {
+        return fail("scratch not mapped in this address space yet");
+    }
+    if (!gpu_memory->IsFullyMappedRange(draw.mesh_program, 128)) {
+        return fail("mesh program header unmapped");
+    }
+    mesh_scratch_next += bytes;
+    const auto& regs = maxwell3d->regs;
+    static std::unordered_set<GPUVAddr> described;
+    if (described.size() < 32 && described.insert(draw.mesh_program).second) {
+        const auto& mesh = draw.mesh;
+        LOG_INFO(HW_GPU,
+                 "Task/mesh emulation: task {:#x} mesh {:#x} workgroups {} | control {:#x} topology {} "
+                 "max_vertices {} max_primitives {} mesh_threads {} task_threads {} | replay {} slots x {} "
+                 "workgroups, scratch {:#x} bytes",
+                 draw.task_program, draw.mesh_program, draw.workgroups, mesh.control, mesh.topology,
+                 mesh.max_vertices, mesh.max_primitives, mesh.mesh_threads, mesh.task_threads,
+                 1U << plan.primitive_slots_shift, draw.MeshWorkgroups(), plan.bytes);
+    }
+
+    // Params at the head of this draw's region, through the inline-upload path so the buffer
+    // cache carries the words to the host buffer before the dispatches read them.
+    const Layout::Params params = plan.Params(scratch, draw);
+    AccelerateInlineToMemory(scratch, sizeof(params),
+                             std::span{reinterpret_cast<const u8*>(&params), sizeof(params)});
+    gpu_memory->FlushCaching();
+
+    // The rewritten programs run through the ordinary compute path with a launch description of
+    // our own: slot 1's constant buffers plus Params as bank 6 (Nx2MeshEmulation::Launch).
+    const auto& bound = maxwell3d->state.shader_stages[0].const_buffers;
+    auto& qmd = kepler_compute->launch_description;
+    const auto saved_qmd = qmd;
+    SCOPE_EXIT {
+        qmd = saved_qmd;
+    };
+    static constexpr VkMemoryBarrier SHADER_BARRIER{
+        .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+        .pNext = nullptr,
+        .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
+        .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
+    };
+    const auto dispatch = [&](GPUVAddr program, bool has_task, u32 workgroups) {
+        qmd = ME::Launch(0, workgroups, bound, scratch, layout);
+        ComputePipeline* const pipeline = pipeline_cache.MeshEmulationComputePipeline(program, has_task);
+        if (!pipeline) {
+            return fail("compute pipeline unavailable");
+        }
+        std::scoped_lock lock{texture_cache.mutex, buffer_cache.mutex};
+        if (!pipeline->Configure(*kepler_compute, *gpu_memory, scheduler, buffer_cache, texture_cache)) {
+            return fail("compute resources unavailable");
+        }
+        scheduler.RequestOutsideRenderPassOperationContext();
+        scheduler.Record([pipeline, workgroups](vk::CommandBuffer cmdbuf) {
+            cmdbuf.PipelineBarrier(vk::PIPELINE_STAGE_GRAPHICS_COMPUTE_TRANSFER,
+                                   VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, SHADER_BARRIER);
+            if (pipeline->IsBound()) {
+                cmdbuf.Dispatch(workgroups, 1, 1);
+            }
+        });
+        return true;
+    };
+    const std::array<u32, 3> max_dim{device.GetMaxComputeWorkGroupCount()};
+    if (draw.MeshWorkgroups() > max_dim[0]) {
+        return fail("too many mesh workgroups");
+    }
+    if (draw.HasTask() && !dispatch(draw.task_program, false, draw.TaskWorkgroups())) {
+        return false;
+    }
+    if (!dispatch(draw.mesh_program, draw.HasTask(), draw.MeshWorkgroups())) {
+        return false;
+    }
+    scheduler.Record([](vk::CommandBuffer cmdbuf) {
+        cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                               VK_PIPELINE_STAGE_VERTEX_SHADER_BIT, 0, SHADER_BARRIER);
+    });
+
+    // Replay: a triangle list over the mesh regions with the passthrough vertex program, the
+    // title's fragment program and the draw's fixed state; Params is stage 0's bank 6.
+    std::array<u8, 128> mesh_header{};
+    gpu_memory->ReadBlock(draw.mesh_program, mesh_header.data(), mesh_header.size());
+    const GPUVAddr fragment_program =
+        regs.IsShaderConfigEnabled(5) && regs.rasterize_enable ? ME::SlotProgramAddress(regs, 5) : 0;
+    auto& draw_state = maxwell3d->draw_manager.draw_state;
+    const auto saved_topology = draw_state.topology;
+    const auto saved_vertex_buffer = draw_state.vertex_buffer;
+    const bool saved_draw_indexed = draw_state.draw_indexed;
+    auto& cbuf6 = maxwell3d->state.shader_stages[0].const_buffers[layout.params_bank];
+    const auto saved_cbuf6 = cbuf6;
+    SCOPE_EXIT {
+        draw_state.topology = saved_topology;
+        draw_state.vertex_buffer = saved_vertex_buffer;
+        draw_state.draw_indexed = saved_draw_indexed;
+        cbuf6 = saved_cbuf6;
+        if (saved_cbuf6.enabled) {
+            buffer_cache.BindGraphicsUniformBuffer(0, layout.params_bank, saved_cbuf6.address, saved_cbuf6.size);
+        } else {
+            buffer_cache.DisableGraphicsUniformBuffer(0, layout.params_bank);
+        }
+    };
+    const u32 vertices = plan.ReplayVertexCount(draw);
+    draw_state.topology = Maxwell::PrimitiveTopology::Triangles;
+    draw_state.vertex_buffer.first = 0;
+    draw_state.vertex_buffer.count = vertices;
+    draw_state.draw_indexed = false;
+    cbuf6 = {.address = scratch, .size = ME::ScratchPlan::ParamsBytes, .enabled = true};
+    buffer_cache.BindGraphicsUniformBuffer(0, layout.params_bank, scratch, ME::ScratchPlan::ParamsBytes);
+    GraphicsPipeline* const pipeline = pipeline_cache.MeshReplayPipeline(mesh_header, fragment_program);
+    if (!pipeline) {
+        return fail("replay pipeline unavailable");
+    }
+    std::scoped_lock lock{buffer_cache.mutex, texture_cache.mutex};
+    pipeline->SetEngine(maxwell3d, gpu_memory);
+    if (!pipeline->Configure(false)) {
+        return fail("replay configure failed");
+    }
+    UpdateDynamicStates();
+    scheduler.Record([vertices](vk::CommandBuffer cmdbuf) { cmdbuf.Draw(vertices, 1, 0, 0); });
+    if (logged < 32 && frame_trace_state == 2) {
+        LOG_INFO(HW_GPU, "frame trace:   mesh emulation task {:#x} mesh {:#x} workgroups {} replay {} vertices",
+                 draw.task_program, draw.mesh_program, draw.workgroups, vertices);
+    }
+    return true;
+}
+
 template <typename Func>
 void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {
 
@@ -340,6 +496,19 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {
             LOG_INFO(HW_GPU, "frame trace:   draw skipped ({}) stages{}", reason, stages);
         }
     };
+    if (VideoCommon::Nx2MeshEmulation::Enabled() && !is_indexed &&
+        maxwell3d->GetNativeMacroEngine().native_turing && maxwell3d->regs.IsShaderConfigEnabled(1)) {
+        namespace ME = VideoCommon::Nx2MeshEmulation;
+        const auto kind = VideoCommon::ClassifyMeshProgram(
+            *gpu_memory, ME::SlotProgramAddress(maxwell3d->regs, 1));
+        if (const auto draw = ME::Describe(*maxwell3d, kind)) {
+            submitted = DrawEmulatedMesh(*draw);
+            if (!submitted) {
+                report_failure("mesh emulation");
+            }
+            return;
+        }
+    }
     GraphicsPipeline* const pipeline{[&] {
         Profile::Scope scope{Profile::Zone::PipelineLookup};
         return pipeline_cache.CurrentGraphicsPipeline();

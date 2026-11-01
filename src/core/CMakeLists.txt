@@ -867,6 +867,7 @@ add_library(core STATIC
     hle/service/nvdrv/devices/nvhost_vic.h
     hle/service/nvdrv/devices/nvmap.cpp
     hle/service/nvdrv/devices/nvmap.h
+    hle/service/nvdrv/devices/nx2_gpu_memory.cpp
     hle/service/nvdrv/devices/nx2_gpu_memory.h
     hle/service/nvdrv/devices/nx2_stub_device.h
     hle/service/nvdrv/nvdata.h

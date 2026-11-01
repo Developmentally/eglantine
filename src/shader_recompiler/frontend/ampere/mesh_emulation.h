@@ -70,14 +70,22 @@ struct Layout {
 
     // Parameter block the host binds as a constant buffer (bank/offset below) for the rewritten
     // compute programs and for the passthrough vertex program.
+    // Each base is followed by its byte size: the buffer cache sizes a storage buffer from the
+    // qword after its pointer when that qword looks like a size.
     struct Params {
         u64 task_base;             ///< 0x00  first task region
-        u64 mesh_base;             ///< 0x08  first mesh region
-        u32 primitive_slots_shift; ///< 0x10  log2 of primitives per workgroup the replay draws
-        u32 primitive_region;      ///< 0x14  ATTR byte offset of the per-primitive attribute groups
+        u64 task_bytes;            ///< 0x08  extent of the task regions
+        u64 mesh_base;             ///< 0x10  first mesh region
+        u64 mesh_bytes;            ///< 0x18  extent of the mesh regions
+        u32 primitive_slots_shift; ///< 0x20  log2 of primitives per workgroup the replay draws
+        u32 primitive_region;      ///< 0x24  ATTR byte offset of the per-primitive attribute groups
         u32 reserved[2];
     };
-    static_assert(sizeof(Params) == 0x20);
+    static_assert(sizeof(Params) == 0x30);
+    static constexpr u32 TaskBaseOffset = 0x00;
+    static constexpr u32 MeshBaseOffset = 0x10;
+    static constexpr u32 SlotsShiftOffset = 0x20;
+    static constexpr u32 PrimitiveRegionOffset = 0x24;
     u32 params_bank = 6;   ///< constant buffer bank holding Params (compute QMDs stop at 7)
     u32 params_offset = 0;
 };
@@ -275,17 +283,21 @@ inline Rewritten RewriteToCompute(std::span<const Instruction> code, const Analy
     auto& out = result.code;
     // Prologue: region offset of this workgroup and the scratch base(s).
     out.push_back(S2R(7, region_reg, 37));
-    out.push_back(UldcU64(uniform_base, layout.params_bank, params + (mesh ? 8 : 0)));
+    out.push_back(UldcU64(uniform_base, layout.params_bank,
+                          params + (mesh ? Layout::MeshBaseOffset : Layout::TaskBaseOffset)));
     if (analysis.has_task) {
-        out.push_back(UldcU64(uniform_task, layout.params_bank, params));
+        out.push_back(UldcU64(uniform_task, layout.params_bank, params + Layout::TaskBaseOffset));
         out.push_back(ShfRightU32(7, task_reg, region_reg, Layout::MeshPerTaskShift));
         out.push_back(IMadImm(7, task_reg, task_reg, Layout::TaskRegionBytes, 255));
-        // Exit when this mesh workgroup is beyond the count its task launched.
+        // Exit when this mesh workgroup is beyond the count its task launched, leaving a zero
+        // primitive count in its region (the scratch is reused, the replay reads every region).
         out.push_back(Lop3AndImm(7, scratch_reg, region_reg, Layout::MeshPerTask - 1));
         out.push_back(LdgUniform(7, uniform_task, task_reg, 4, region_reg, 4));
         out.push_back(ISetpGeU32(0, scratch_reg, region_reg));
-        out.push_back(Exit(0));
         out.push_back(S2R(7, region_reg, 37));
+        out.push_back(IMadImm(0, region_reg, region_reg, Layout::MeshRegionBytes, 255));
+        out.push_back(StgUniform(0, uniform_base, region_reg, Layout::MapOffset + 3 * 4, 255, 4));
+        out.push_back(Exit(0));
     }
     out.push_back(IMadImm(7, region_reg, region_reg, mesh ? Layout::MeshRegionBytes : Layout::TaskRegionBytes, 255));
 
@@ -420,14 +432,14 @@ inline LoweredProgram GeneratePassthroughVertexProgram(const PassthroughLayout& 
     emit(0x5cb0000000000000ULL | P | Prim | (u64{2} << 8) | (u64{2} << 10) | (u64{Tmp0} << 20) | (u64{1} << 39)); // F2I.U32.F32.FLOOR
     iscadd(Tmp0, Prim, Prim, 1);                            // 3p
     iadd(Corner, Vid, Tmp0, true);                          // corner i = v - 3p
-    mov_cbuf(Tmp1, bank, params + 0x10);                    // primitive slots shift
+    mov_cbuf(Tmp1, bank, params + Layout::SlotsShiftOffset); // primitive slots shift
     shr_reg(Group, Prim, Tmp1);                             // workgroup m
     mov_imm(Tmp0, 1);
     shl_reg(Tmp0, Tmp0, Tmp1);
     iadd_imm(Tmp0, Tmp0, 0xffffffff);                       // mask
     and_reg(Slot, Prim, Tmp0);                              // primitive slot within the workgroup
-    mov_cbuf(BaseLo, bank, params + 8);
-    mov_cbuf(BaseHi, bank, params + 12);
+    mov_cbuf(BaseLo, bank, params + Layout::MeshBaseOffset);
+    mov_cbuf(BaseHi, bank, params + Layout::MeshBaseOffset + 4);
     shl_imm(Tmp0, Group, Layout::MeshRegionShift);
     mov_imm(Zero, 0);
     iadd(BaseLo, BaseLo, Tmp0, false, true);                // region base = mesh_base + m * MeshRegionBytes
@@ -459,7 +471,7 @@ inline LoweredProgram GeneratePassthroughVertexProgram(const PassthroughLayout& 
     }
     if (!in.primitive_attributes.empty()) {
         const u32 primitive_group_bytes = static_cast<u32>(in.primitive_attributes.size()) * 128;
-        mov_cbuf(Tmp1, bank, params + 0x14);                // primitive region offset
+        mov_cbuf(Tmp1, bank, params + Layout::PrimitiveRegionOffset); // primitive region offset
         shr_imm(Tmp0, Slot, 5);
         mul_const(PAddrLo, Tmp0, primitive_group_bytes, Idx);
         and_imm(Tmp0, Slot, 31);

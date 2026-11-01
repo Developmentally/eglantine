@@ -84,6 +84,41 @@ public:
         }
     }
 
+    // Whether any mapping or sparse region touches [gpu_address, +size).
+    bool IsGpuRangeMapped(u64 gpu_address, u64 size) {
+        std::scoped_lock lk{mutex};
+        const u64 end = gpu_address + size;
+        for (const auto& m : mappings) {
+            if (m.gpu_address < end && gpu_address < m.gpu_address + m.size) {
+                return true;
+            }
+        }
+        for (const auto& [start, region_size] : sparse_regions) {
+            if (start < end && gpu_address < start + region_size) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // Emulator-owned scratch of the task/mesh emulation (video_core/nx2_mesh_emulation.h), mapped
+    // once per session like a GPU-only region; zero until it exists.
+    struct Scratch {
+        u64 gpu_address{};
+        u64 cpu_address{};
+        u64 size{};
+    };
+
+    void SetMeshScratch(const Scratch& scratch) {
+        std::scoped_lock lk{scratch_mutex};
+        mesh_scratch = scratch;
+    }
+
+    Scratch MeshScratch() const {
+        std::scoped_lock lk{scratch_mutex};
+        return mesh_scratch;
+    }
+
     // True inside a GPU-only (sub 214) region: the client never maps those, so nothing the GPU
     // wrote there is ever read back through host memory.
     bool IsGpuOnly(u64 gpu_address) const {
@@ -185,6 +220,8 @@ public:
         client_ranges.clear();
         gpu_only.clear();
         gpu_only_count.store(0, std::memory_order_release);
+        std::scoped_lock sl{scratch_mutex};
+        mesh_scratch = {};
     }
 
     // Device (SMMU) address of a CPU range an address space mapped; used to present images.
@@ -274,6 +311,9 @@ private:
     std::vector<Mapping> client_ranges; ///< Sub 101 registrations (gpu_address == cpu_address)
     std::vector<Mapping> gpu_only;
     std::atomic<size_t> gpu_only_count{};
+
+    mutable std::mutex scratch_mutex;
+    Scratch mesh_scratch;
 };
 
 // Device node that Switch 2 nvgpu drivers open but Switch 1 never had (e.g. /dev/nvhost-tsg-gpu).

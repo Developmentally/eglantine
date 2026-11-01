@@ -15,6 +15,7 @@
 #include "video_core/control/channel_state_cache.h"
 #include "video_core/engines/maxwell_dma.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
+#include "video_core/nx2_mesh_emulation.h"
 #include "video_core/rasterizer_interface.h"
 #include "video_core/renderer_vulkan/blit_image.h"
 #include "video_core/renderer_vulkan/vk_buffer_cache.h"
@@ -164,6 +165,10 @@ private:
     /// the current draw was it (nothing left to draw).
     bool ResetIndirectRecordsOnCpu(bool is_indexed);
 
+    /// Task/mesh emulation (EDEN_NX2_MESH_EMU=1): the native mesh draw in flight, run as the
+    /// rewritten compute programs over the scratch and a replay draw. True when submitted.
+    bool DrawEmulatedMesh(const VideoCommon::Nx2MeshEmulation::DrawDescription& draw);
+
     void FlushWork();
 
     void UpdateDynamicStates();
@@ -254,6 +259,10 @@ private:
     u32 frame_counter = 0;
     u32 frame_trace_state = 0;
     u32 traced_image_frame = 0;
+    // Task/mesh emulation scratch: the session's region, rung through per draw.
+    GPUVAddr mesh_scratch_base = 0;
+    u64 mesh_scratch_size = 0;
+    u64 mesh_scratch_next = 0;
     bool bias_vs_active = false;
     std::unordered_map<u64, u32> vs_dump_counts;
 };

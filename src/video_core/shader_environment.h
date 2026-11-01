@@ -21,6 +21,7 @@
 #include "common/polyfill_thread.h"
 #include "common/unique_function.h"
 #include "shader_recompiler/environment.h"
+#include "shader_recompiler/frontend/ampere/mesh_emulation.h"
 #include "video_core/engines/maxwell_3d.h"
 
 namespace Tegra {
@@ -28,6 +29,16 @@ class Memorymanager;
 }
 
 namespace VideoCommon {
+
+/// The native (Ampere) instructions of the program whose code starts at `code_address`, as far
+/// as its control flow lets the capture see. Throws Shader::RuntimeError on unmapped memory.
+[[nodiscard]] std::vector<Shader::Ampere::Instruction> ReadNativeProgram(
+    Tegra::MemoryManager& gpu_memory, GPUVAddr code_address);
+
+/// Task/mesh classification of the native graphics program at `program_base` (128-byte header,
+/// then code), remembered per address. None for ordinary and unreadable programs.
+[[nodiscard]] Shader::Ampere::MeshEmulation::ProgramKind ClassifyMeshProgram(
+    Tegra::MemoryManager& gpu_memory, GPUVAddr program_base);
 
 class GenericEnvironment : public Shader::Environment {
 public:
@@ -79,6 +90,9 @@ protected:
     std::optional<u64> TryFindSize();
 
     void InitializeNativeCode(u32 source_header_size = 128);
+    /// `code` = the current `sph`, then the lowered Maxwell instructions with their scheduling
+    /// words, then the native address map.
+    void AssembleLoweredCode(const Shader::Ampere::LoweredProgram& lowered);
     size_t native_source_size{};
 
     Tegra::Texture::TICEntry ReadTextureInfo(GPUVAddr tic_addr, u32 tic_limit,
@@ -164,6 +178,84 @@ public:
 
 private:
     Tegra::Engines::KeplerCompute* kepler_compute{};
+};
+
+// A native task or mesh program rewritten into a 32-thread compute program over the emulation
+// scratch (shader_recompiler/frontend/ampere/mesh_emulation.h). Constant buffers and textures
+// come from the launch description the rasterizer installs for the dispatch
+// (Nx2MeshEmulation::Launch), as for ComputeEnvironment.
+class MeshEmulationEnvironment final : public GenericEnvironment {
+public:
+    explicit MeshEmulationEnvironment(Tegra::Engines::KeplerCompute& kepler_compute_,
+                                      Tegra::MemoryManager& gpu_memory_, GPUVAddr program_base_,
+                                      bool has_task);
+
+    ~MeshEmulationEnvironment() override = default;
+
+    u32 ReadCbufValue(u32 cbuf_index, u32 cbuf_offset) override;
+
+    Shader::TextureType ReadTextureType(u32 handle) override;
+
+    Shader::TexturePixelFormat ReadTexturePixelFormat(u32 handle) override;
+
+    bool IsTexturePixelFormatInteger(u32 handle) override;
+
+    u32 ReadViewportTransformState() override {
+        return viewport_transform_state;
+    }
+
+    std::optional<Shader::ReplaceConstant> GetReplaceConstBuffer(u32, u32) override {
+        return std::nullopt;
+    }
+
+    [[nodiscard]] const Shader::Ampere::MeshEmulation::Analysis& Analysis() const noexcept {
+        return analysis;
+    }
+
+    [[nodiscard]] std::span<const u8, 128> Header() const noexcept {
+        return header;
+    }
+
+private:
+    Tegra::Engines::KeplerCompute* kepler_compute{};
+    Shader::Ampere::MeshEmulation::Analysis analysis;
+    std::array<u8, 128> header{};
+};
+
+// The generated vertex program that replays one mesh workgroup's scratch per primitive slot
+// (GeneratePassthroughVertexProgram), bound in the vertex slot of the replay draw with the
+// title's fragment program. Its only inputs are the scratch Params in bank 6 of stage 0.
+class PassthroughVertexEnvironment final : public GenericEnvironment {
+public:
+    explicit PassthroughVertexEnvironment(Tegra::Engines::Maxwell3D& maxwell3d_,
+                                          Tegra::MemoryManager& gpu_memory_,
+                                          std::span<const u8, 128> mesh_header,
+                                          std::span<const u8> primitive_header);
+
+    ~PassthroughVertexEnvironment() override = default;
+
+    u32 ReadCbufValue(u32 cbuf_index, u32 cbuf_offset) override;
+
+    Shader::TextureType ReadTextureType(u32) override {
+        return Shader::TextureType::Color2D;
+    }
+
+    Shader::TexturePixelFormat ReadTexturePixelFormat(u32) override {
+        return Shader::TexturePixelFormat::A8B8G8R8_UNORM;
+    }
+
+    bool IsTexturePixelFormatInteger(u32) override {
+        return false;
+    }
+
+    u32 ReadViewportTransformState() override;
+
+    std::optional<Shader::ReplaceConstant> GetReplaceConstBuffer(u32, u32) override {
+        return std::nullopt;
+    }
+
+private:
+    Tegra::Engines::Maxwell3D* maxwell3d{};
 };
 
 class FileEnvironment final : public Shader::Environment {

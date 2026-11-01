@@ -605,6 +605,73 @@ ComputePipeline* PipelineCache::CurrentComputePipeline() {
     return pipeline.get();
 }
 
+ComputePipeline* PipelineCache::MeshEmulationComputePipeline(GPUVAddr program, bool has_task) {
+    // Keyed apart from the shader cache, whose memo for this very address holds its rejection
+    // as a graphics stage. A failed build is remembered as null.
+    const u64 slot_key = program ^ (has_task ? 1ULL << 63 : 0);
+    const auto [pair, is_new] = mesh_compute_cache.try_emplace(slot_key);
+    auto& pipeline = pair->second;
+    if (!is_new) {
+        return pipeline.get();
+    }
+    try {
+        VideoCommon::MeshEmulationEnvironment env{*kepler_compute, *gpu_memory, program, has_task};
+        const ComputePipelineCacheKey key{
+            .unique_hash = env.CalculateHash(),
+            .shared_memory_size = 0,
+            .workgroup_size{32, 1, 1},
+        };
+        main_pools.ReleaseContents();
+        pipeline = CreateComputePipeline(main_pools, key, env, nullptr, false);
+    } catch (const Shader::Exception& exception) {
+        LOG_ERROR(Render_Vulkan, "Task/mesh emulation: {}", exception.what());
+    }
+    return pipeline.get();
+}
+
+GraphicsPipeline* PipelineCache::MeshReplayPipeline(std::span<const u8, 128> mesh_header,
+                                                    GPUVAddr fragment_program) try {
+    // The fragment program goes through the shader cache like any other (depth-only draws have
+    // none); the vertex program is generated, so its hash is its own key.
+    const ShaderInfo* fragment_info{};
+    if (fragment_program != 0) {
+        const std::optional<VAddr> fragment_cpu_address{gpu_memory->GpuToCpuAddress(fragment_program)};
+        if (!fragment_cpu_address) {
+            return nullptr;
+        }
+        fragment_info = TryGet(*fragment_cpu_address);
+        if (!fragment_info) {
+            VideoCommon::GraphicsEnvironment env{*maxwell3d, *gpu_memory, Maxwell::ShaderType::Pixel,
+                                                 fragment_program, 0};
+            fragment_info = MakeShaderInfo(env, *fragment_cpu_address);
+        }
+    }
+    // Per-primitive attributes would come from the geometry slot's header; not wired yet.
+    VideoCommon::PassthroughVertexEnvironment vertex_env{*maxwell3d, *gpu_memory, mesh_header, {}};
+    GraphicsPipelineCacheKey key{};
+    key.unique_hashes[1] = vertex_env.CalculateHash();
+    key.unique_hashes[5] = fragment_info ? fragment_info->unique_hash : 0;
+    key.state.Refresh(*maxwell3d, dynamic_features);
+    const auto [pair, is_new] = mesh_replay_cache.try_emplace(key);
+    auto& pipeline = pair->second;
+    if (!is_new) {
+        return pipeline.get();
+    }
+    boost::container::static_vector<Shader::Environment*, 2> envs{&vertex_env};
+    std::optional<VideoCommon::GraphicsEnvironment> fragment_env;
+    if (fragment_info) {
+        fragment_env.emplace(*maxwell3d, *gpu_memory, Maxwell::ShaderType::Pixel, fragment_program, 0U);
+        fragment_env->SetCachedSize(fragment_info->size_bytes);
+        envs.push_back(&*fragment_env);
+    }
+    main_pools.ReleaseContents();
+    pipeline = CreateGraphicsPipeline(main_pools, key, envs, nullptr, false);
+    return pipeline.get();
+} catch (const Shader::Exception& exception) {
+    LOG_ERROR(Render_Vulkan, "Task/mesh replay pipeline: {}", exception.what());
+    return nullptr;
+}
+
 void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading,
                                       const VideoCore::DiskResourceLoadCallback& callback) {
     if (title_id == 0) {
