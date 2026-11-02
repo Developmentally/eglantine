@@ -757,6 +757,8 @@ void RasterizerVulkan::DrawChunkBatch(ChunkBatch& batch) {
     const GPUVAddr index_end = arena + indices_bytes - 1;
     index_mut.limit_addr_high = static_cast<u32>(index_end >> 32);
     index_mut.limit_addr_low = static_cast<u32>(index_end);
+    // The buffer cache binds from the draw state's copy of the registers, addresses included.
+    draw_state_mut.index_buffer = index_mut;
     draw_state_mut.index_buffer.first = 0;
     draw_state_mut.index_buffer.count = indices_bytes >> batch.index_shift;
     maxwell3d->dirty.flags[VideoCommon::Dirty::IndexBuffer] = true;
