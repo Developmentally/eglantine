@@ -935,6 +935,29 @@ void RasterizerVulkan::DrawChunkBatch(ChunkBatch& batch) {
                      count, draw.index_address, index_offset, fmt::ptr(index_buffer->Handle()), draw.index_count,
                      draw.vb_address[0], draw.vb_size[0], batch.rows[index * ChunkBatch::MaxSlots]);
         }
+        // EDEN_NX2_CHUNK_BATCH_RECONFIGURE=1: configure the patched pipeline again before every
+        // draw after the first (experiments: tells whether what the later draws lack is in
+        // Configure at all).
+        static const bool reconfigure = std::getenv("EDEN_NX2_CHUNK_BATCH_RECONFIGURE") != nullptr;
+        if (reconfigure && index != 0) {
+            maxwell3d->dirty.flags.set();
+            if (!batch.pipeline->Configure(true)) {
+                continue;
+            }
+            UpdateDynamicStates();
+            scheduler.RequestRenderpass(texture_cache.GetFramebuffer());
+            for (u32 i = 0; i < Maxwell::NumVertexArrays; ++i) {
+                if ((batch.stream_mask >> i) & 1) {
+                    const auto [vb, vb_offset] = buffer_cache.ObtainBuffer(
+                        draw.vb_address[i], draw.vb_size[i], VideoCommon::ObtainBufferSynchronize::NoSynchronize,
+                        VideoCommon::ObtainBufferOperation::DoNothing);
+                    buffer_cache.runtime.BindVertexBuffer(i, vb->Handle(), vb_offset, draw.vb_size[i],
+                                                          regs.vertex_streams[i].stride);
+                }
+            }
+            buffer_cache.runtime.BindIndexBuffer(topology, index_format, draw.first_index, draw.index_count,
+                                                 index_buffer->Handle(), index_offset, index_bytes);
+        }
         scheduler.Record([draw, row = row0 ? 0U : index](vk::CommandBuffer cmdbuf) {
             cmdbuf.DrawIndexed(draw.index_count, 1, draw.first_index, static_cast<u32>(draw.base_vertex), row);
         });
