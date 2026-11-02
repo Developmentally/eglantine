@@ -2179,6 +2179,11 @@ Binding BufferCache<P>::StorageBufferBinding(GPUVAddr ssbo_addr, u32 cbuf_index,
     }
 
     const auto size = [&]() {
+        if (!storage_buffer_sizes.empty()) {
+            if (const auto it = storage_buffer_sizes.find(gpu_addr); it != storage_buffer_sizes.end()) {
+                return it->second;
+            }
+        }
         const u32 memory_layout_size =
             static_cast<u32>(gpu_memory->GetMemoryLayoutSize(gpu_addr));
         const u64 next_qword = gpu_memory->Read<u64>(ssbo_addr + 8);

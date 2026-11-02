@@ -301,56 +301,56 @@ bool RasterizerVulkan::ResetIndirectRecordsOnCpu(bool is_indexed) {
 }
 
 namespace {
-bool ChunkBatchingEnabled() {
-    static const bool enabled = [] {
+// EDEN_NX2_CHUNK_BATCH: 0 off, 1 on, 2 on with every window exactly the range of its first draw
+// (one draw per batch, bindings identical to the game's: isolates the batched draw path).
+u32 ChunkBatchingMode() {
+    static const u32 mode = [] {
         const char* value = std::getenv("EDEN_NX2_CHUNK_BATCH");
-        return value != nullptr && value[0] == '1';
+        return value != nullptr && value[0] >= '1' && value[0] <= '9' ? u32(value[0] - '0') : 0U;
     }();
-    return enabled;
+    return mode;
 }
 
 // A window of memory around `pointer` that holds [pointer, pointer + need), as large as 32 MiB so
-// that the following chunks fall inside it too. The window is one continuous mapping: a storage
-// buffer bound at its base is sized from the mapping the base is in, so a window straddling two
-// allocations would end before the pointer.
+// that the following chunks fall inside it too. The device memory behind the window must be
+// contiguous: the host buffer bound over it is one allocation.
 std::optional<std::pair<GPUVAddr, u64>> MappedWindow(const Tegra::MemoryManager& gpu_memory,
                                                      GPUVAddr pointer, u64 need) {
+    if (ChunkBatchingMode() == 2) {
+        return gpu_memory.IsContinuousRange(pointer, need) ? std::optional{std::pair{pointer, need}}
+                                                           : std::nullopt;
+    }
     constexpr u64 Granule = 0x10000;
     constexpr u64 MaxWindow = u64{32} << 20;
     constexpr u64 MaxBefore = u64{8} << 20;
-    const u64 forward = gpu_memory.GetMemoryLayoutSize(pointer);
-    if (forward < need) {
+    const GPUVAddr first = Common::AlignDown(pointer, 0x1000);
+    const GPUVAddr last = Common::AlignUp(pointer + need, 0x1000);
+    if (!gpu_memory.IsContinuousRange(first, last - first)) {
         return std::nullopt;
     }
-    // The lowest granule-aligned base whose mapping still reaches the pointer (monotonic in base).
-    const GPUVAddr top = Common::AlignDown(pointer, Granule);
-    GPUVAddr lo = top - (std::min)(top, MaxBefore);
-    GPUVAddr hi = top;
+    // Lowest base and highest end that keep the range contiguous (both monotonic), by bisection.
+    GPUVAddr lo = first - (std::min)(first, MaxBefore);
+    GPUVAddr hi = first;
     while (lo < hi) {
         const GPUVAddr mid = lo + Common::AlignDown((hi - lo) / 2, Granule);
-        if (gpu_memory.GetMemoryLayoutSize(mid) >= pointer + need - mid) {
+        if (gpu_memory.IsContinuousRange(mid, last - mid)) {
             hi = mid;
         } else {
             lo = mid + Granule;
         }
     }
-    GPUVAddr base = hi;
-    u64 size = Common::AlignDown((std::min)(pointer + forward, base + MaxWindow) - base, 0x1000);
-    // Device memory behind the window must be contiguous as well; shrink towards the pointer
-    // until it is.
-    while (!gpu_memory.IsContinuousRange(base, size)) {
-        const GPUVAddr new_base = Common::AlignDown(base + (pointer - base) / 2, 0x1000);
-        const u64 new_end = Common::AlignUp(pointer + need + (base + size - pointer - need) / 2, 0x1000);
-        if (new_base == base && new_end == base + size) {
-            return std::nullopt;
+    const GPUVAddr base = hi;
+    lo = last;
+    hi = base + MaxWindow;
+    while (lo < hi) {
+        const GPUVAddr mid = hi - Common::AlignDown((hi - lo) / 2, Granule);
+        if (gpu_memory.IsContinuousRange(base, mid - base)) {
+            lo = mid;
+        } else {
+            hi = mid - Granule;
         }
-        base = new_base;
-        size = new_end - base;
     }
-    if (pointer + need > base + size) {
-        return std::nullopt;
-    }
-    return std::pair{base, size};
+    return std::pair{base, lo - base};
 }
 } // Anonymous namespace
 
@@ -416,7 +416,7 @@ std::optional<RasterizerVulkan::ChunkPattern> RasterizerVulkan::MatchChunkPatter
 }
 
 bool RasterizerVulkan::TryBatchChunkDraw(bool is_indexed, u32 instance_count) {
-    if (!ChunkBatchingEnabled()) {
+    if (ChunkBatchingMode() == 0) {
         return false;
     }
     maxwell3d->record_writes_since_draw = true;
@@ -513,6 +513,7 @@ bool RasterizerVulkan::BeginChunkBatch(const ChunkPattern& pattern) {
         batch.span_base[k] = window->first;
         batch.span_size[k] = window->second;
         batch.table.slots[k] = {bank, pattern.slots[k]};
+        buffer_cache.storage_buffer_sizes[window->first] = static_cast<u32>(window->second);
     }
     batch.table.num_slots = pattern.num_slots;
     const u32 table_slot_offset = Common::AlignUp(cbuf.size, 16U);
@@ -634,6 +635,7 @@ bool RasterizerVulkan::ExtendChunkBatch(const ChunkPattern& pattern) {
     const GPUVAddr index_address = regs.index_buffer.StartAddress();
     const u64 index_need = u64{draw_state.index_buffer.first + draw_state.index_buffer.count} << batch.index_shift;
     if (index_address < batch.index_base || index_address + index_need > batch.index_base + batch.index_size) {
+        ++chunk_batch_stats.miss_index;
         return false;
     }
     std::array<u32, ChunkBatch::MaxSlots> deltas{};
@@ -641,6 +643,7 @@ bool RasterizerVulkan::ExtendChunkBatch(const ChunkPattern& pattern) {
         const GPUVAddr pointer = gpu_memory->Read<u64>(pattern.cbuf_address + pattern.slots[k]);
         const u32 size = gpu_memory->Read<u32>(pattern.cbuf_address + pattern.slots[k] + 8);
         if (pointer < batch.span_base[k] || pointer + size > batch.span_base[k] + batch.span_size[k]) {
+            ++chunk_batch_stats.miss_slot[k];
             return false;
         }
         deltas[k] = static_cast<u32>(pointer - batch.span_base[k]);
@@ -662,6 +665,7 @@ void RasterizerVulkan::FlushChunkBatch() {
         return;
     }
     batch.active = false;
+    buffer_cache.storage_buffer_sizes.clear();
     const u32 count = static_cast<u32>(batch.commands.size());
     if (count == 0) {
         return;
@@ -696,11 +700,12 @@ void RasterizerVulkan::FlushChunkBatch() {
     if (const auto now = std::chrono::steady_clock::now(); now - stats.window > std::chrono::seconds{10}) {
         LOG_INFO(HW_GPU,
                  "Chunk batches in the last 10 s: {} batches, {} draws ({:.0f} per batch); ended by "
-                 "a chunk outside the windows {}, by another draw {}, by other work {}",
+                 "a chunk outside the windows {} (indices {}, slots {}), by another draw {}, by "
+                 "other work {}",
                  stats.batches, stats.draws,
                  stats.batches ? static_cast<double>(stats.draws) / static_cast<double>(stats.batches) : 0.0,
-                 stats.ended_by_miss, stats.ended_by_draw,
-                 stats.batches - stats.ended_by_miss - stats.ended_by_draw);
+                 stats.ended_by_miss, stats.miss_index, fmt::join(stats.miss_slot, ","),
+                 stats.ended_by_draw, stats.batches - stats.ended_by_miss - stats.ended_by_draw);
         stats = {.window = now};
     }
     batch.commands.clear();
@@ -1115,7 +1120,7 @@ void RasterizerVulkan::RecordDrawStats(u64 draws, u64 vertices, bool indirect) {
 void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
     VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::Draw};
     SCOPE_EXIT {
-        if (ChunkBatchingEnabled()) {
+        if (ChunkBatchingMode() != 0) {
             maxwell3d->ClearWritesSinceDraw();
         }
     };

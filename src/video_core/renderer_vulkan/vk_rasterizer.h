@@ -211,6 +211,8 @@ private:
         u64 draws{};
         u64 ended_by_miss{};  ///< a chunk draw whose records or indices fell outside the windows
         u64 ended_by_draw{};  ///< a draw that is not a chunk draw
+        u64 miss_index{};
+        std::array<u64, ChunkBatch::MaxSlots> miss_slot{};
     } chunk_batch_stats;
     /// The pattern of register writes since the previous draw, if it is a chunk patch.
     struct ChunkPattern {

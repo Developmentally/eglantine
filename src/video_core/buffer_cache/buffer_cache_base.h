@@ -345,6 +345,9 @@ public:
     Common::SpinRecursiveMutex mutex;
     Runtime& runtime;
     bool any_buffer_uploaded = false;
+    /// Sizes for storage buffers whose constant-buffer pointer the rasterizer rewrote to the base
+    /// of a span wider than the mapping that base is in (chunk batching), keyed by that base.
+    std::unordered_map<GPUVAddr, u32> storage_buffer_sizes;
 
 private:
     template <typename Func>
