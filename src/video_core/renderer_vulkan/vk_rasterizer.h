@@ -211,6 +211,9 @@ private:
             s32 base_vertex;
             std::array<GPUVAddr, Tegra::Engines::Maxwell3D::Regs::NumVertexArrays> vb_address{};
             std::array<u32, Tegra::Engines::Maxwell3D::Regs::NumVertexArrays> vb_size{};
+            /// EDEN_NX2_CHUNK_BATCH_CBUF_HASH: constant buffer contents of the vertex and the
+            /// patched stage at draw time.
+            std::array<std::array<u64, Tegra::Engines::Maxwell3D::Regs::MaxConstBuffers>, 2> cbuf_hash{};
         };
         std::vector<Draw> draws;
         GraphicsPipeline* base_pipeline{};  ///< the game's pipeline for these draws

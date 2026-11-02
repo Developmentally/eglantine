@@ -754,6 +754,26 @@ bool RasterizerVulkan::ExtendChunkBatch(ChunkBatch& batch, const ChunkPattern& p
         deltas[k] = static_cast<u32>(pointer - batch.span_base[k]);
     }
     batch.rows.insert(batch.rows.end(), deltas.begin(), deltas.end());
+    // Diagnostic: the contents of the constant buffers the stages read, hashed, to see whether
+    // the game rewrites them between chunk draws through memory the emulator does not watch.
+    static const bool hash_cbufs = std::getenv("EDEN_NX2_CHUNK_BATCH_CBUF_HASH") != nullptr;
+    if (hash_cbufs) {
+        for (size_t st : {size_t{0}, batch.stage}) {
+            for (u32 b = 0; b < Maxwell::MaxConstBuffers; ++b) {
+                const auto& c = maxwell3d->state.shader_stages[st].const_buffers[b];
+                if (!c.enabled || c.size == 0 || c.size > 0x10000) {
+                    continue;
+                }
+                std::vector<u8> bytes(c.size);
+                gpu_memory->ReadBlockUnsafe(c.address, bytes.data(), c.size);
+                u64 h = 1469598103934665603ULL;
+                for (const u8 byte : bytes) {
+                    h = (h ^ byte) * 1099511628211ULL;
+                }
+                draw.cbuf_hash[st == 0 ? 0 : 1][b] = h;
+            }
+        }
+    }
     batch.draws.push_back(draw);
     return true;
 }
@@ -931,9 +951,21 @@ void RasterizerVulkan::DrawChunkBatch(ChunkBatch& batch) {
                                              index_buffer->Handle(), index_offset, index_bytes);
         if (logged_chunk_draws < 24) {
             ++logged_chunk_draws;
-            LOG_INFO(HW_GPU, "Chunk draw {}/{}: indices {:#x} (+{:#x} in {}) count {} vb0 {:#x}+{:#x}; row {}", index,
-                     count, draw.index_address, index_offset, fmt::ptr(index_buffer->Handle()), draw.index_count,
-                     draw.vb_address[0], draw.vb_size[0], batch.rows[index * ChunkBatch::MaxSlots]);
+            std::string changed;
+            for (size_t which = 0; which < 2; ++which) {
+                for (u32 b = 0; b < Maxwell::MaxConstBuffers; ++b) {
+                    const u64 h = draw.cbuf_hash[which][b];
+                    if (h != 0 && h != batch.draws.front().cbuf_hash[which][b]) {
+                        changed += fmt::format(" {}:b{}", which == 0 ? "vs" : "gs", b);
+                    }
+                }
+            }
+            LOG_INFO(HW_GPU,
+                     "Chunk draw {}/{}: indices {:#x} (+{:#x} in {}) count {} vb0 {:#x}+{:#x}; row {}; cbufs differing "
+                     "from draw 0:{}",
+                     index, count, draw.index_address, index_offset, fmt::ptr(index_buffer->Handle()),
+                     draw.index_count, draw.vb_address[0], draw.vb_size[0], batch.rows[index * ChunkBatch::MaxSlots],
+                     changed.empty() ? " none" : changed);
         }
         // EDEN_NX2_CHUNK_BATCH_RECONFIGURE=1: configure the patched pipeline again before every
         // draw after the first (experiments: tells whether what the later draws lack is in
