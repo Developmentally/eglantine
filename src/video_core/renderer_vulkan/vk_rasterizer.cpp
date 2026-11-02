@@ -300,6 +300,401 @@ bool RasterizerVulkan::ResetIndirectRecordsOnCpu(bool is_indexed) {
     return true;
 }
 
+namespace {
+bool ChunkBatchingEnabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("EDEN_NX2_CHUNK_BATCH");
+        return value != nullptr && value[0] == '1';
+    }();
+    return enabled;
+}
+
+// A window of mapped memory around `pointer` that holds [pointer, pointer + need): as large as
+// 32 MiB so that the following chunks fall inside it too, or just the range itself.
+std::optional<std::pair<GPUVAddr, u64>> MappedWindow(const Tegra::MemoryManager& gpu_memory,
+                                                     GPUVAddr pointer, u64 need) {
+    constexpr u64 Alignment = 0x10000;
+    for (const u64 size : {u64{32} << 20, u64{8} << 20, u64{2} << 20}) {
+        const GPUVAddr base = Common::AlignDown(pointer - (std::min)(pointer, size / 4), Alignment);
+        if (pointer + need <= base + size && gpu_memory.IsFullyMappedRange(base, size)) {
+            return std::pair{base, size};
+        }
+    }
+    const GPUVAddr base = Common::AlignDown(pointer, 0x1000);
+    const u64 size = Common::AlignUp(pointer + need - base, 0x1000);
+    if (gpu_memory.IsFullyMappedRange(base, size)) {
+        return std::pair{base, size};
+    }
+    return std::nullopt;
+}
+} // Anonymous namespace
+
+std::optional<RasterizerVulkan::ChunkPattern> RasterizerVulkan::MatchChunkPattern() const {
+    constexpr auto Index = [](size_t byte_offset) { return static_cast<u32>(byte_offset / sizeof(u32)); };
+    constexpr u32 CbOffset = Index(offsetof(Maxwell, const_buffer.offset));
+    constexpr u32 CbData = Index(offsetof(Maxwell, const_buffer.buffer));
+    constexpr u32 CbDataWords = 16;
+    constexpr u32 IndexHigh = Index(offsetof(Maxwell, index_buffer.start_addr_high));
+    constexpr u32 IndexLow = Index(offsetof(Maxwell, index_buffer.start_addr_low));
+    constexpr u32 IndexFirst = Index(offsetof(Maxwell, index_buffer.first));
+    constexpr u32 IndexCount = Index(offsetof(Maxwell, index_buffer.count));
+    constexpr u32 DrawBegin = Index(offsetof(Maxwell, draw.begin));
+    constexpr u32 DrawEnd = Index(offsetof(Maxwell, draw.end));
+    const auto& writes = maxwell3d->WritesSinceDraw();
+    if (writes.empty() || writes.size() >= 256) {
+        return std::nullopt;
+    }
+    // Replay CB_OFFSET through the inline data writes to find the patched bytes.
+    u32 offset = ~0U;
+    boost::container::static_vector<std::pair<u32, u32>, 8> ranges; // [begin, end) in the cbuf
+    for (const auto& [method_raw, value] : writes) {
+        const u32 method = method_raw & 0xffff;
+        const u32 amount = method_raw >> 16;
+        const u32 count = amount != 0 ? amount : 1;
+        if (method == CbOffset && count == 1) {
+            offset = value;
+            continue;
+        }
+        if (method >= CbData && method + count <= CbData + CbDataWords) {
+            if (offset == ~0U) {
+                return std::nullopt;
+            }
+            const u32 end = offset + count * 4;
+            if (!ranges.empty() && ranges.back().second == offset) {
+                ranges.back().second = end;
+            } else if (ranges.size() < ranges.capacity()) {
+                ranges.push_back({offset, end});
+            } else {
+                return std::nullopt;
+            }
+            offset = end;
+            continue;
+        }
+        if (count == 1 && (method == IndexHigh || method == IndexLow || method == IndexFirst ||
+                           method == IndexCount || method == DrawBegin || method == DrawEnd)) {
+            continue;
+        }
+        return std::nullopt;
+    }
+    if (ranges.empty() || ranges.size() > ChunkBatch::MaxSlots) {
+        return std::nullopt;
+    }
+    ChunkPattern pattern{.cbuf_address = maxwell3d->regs.const_buffer.Address()};
+    for (const auto& [begin, end] : ranges) {
+        // A 64-bit pointer and its size (three or four words), 8-byte aligned.
+        if (begin % 8 != 0 || end - begin < 12 || end - begin > 16) {
+            return std::nullopt;
+        }
+        pattern.slots[pattern.num_slots++] = begin;
+    }
+    return pattern;
+}
+
+bool RasterizerVulkan::TryBatchChunkDraw(bool is_indexed, u32 instance_count) {
+    if (!ChunkBatchingEnabled()) {
+        return false;
+    }
+    maxwell3d->record_writes_since_draw = true;
+    const auto& draw_state = maxwell3d->draw_manager.draw_state;
+    const bool simple = is_indexed && instance_count <= 1 &&
+                        draw_state.inline_index_draw_indexes.empty() &&
+                        draw_state.draw_mode == Tegra::Engines::Maxwell3D::DrawManager::DrawMode::General;
+    const auto pattern = simple ? MatchChunkPattern() : std::nullopt;
+    if (chunk_batch.active) {
+        if (pattern && ExtendChunkBatch(*pattern)) {
+            return true;
+        }
+        FlushChunkBatch();
+    }
+    return pattern && BeginChunkBatch(*pattern);
+}
+
+bool RasterizerVulkan::BeginChunkBatch(const ChunkPattern& pattern) {
+    static u32 logged{};
+    const auto fail = [&](std::string_view reason) {
+        if (logged++ < 32) {
+            LOG_WARNING(HW_GPU, "Chunk batch not started: {} (cbuf {:#x} slots {})", reason,
+                        pattern.cbuf_address, pattern.num_slots);
+        }
+        return false;
+    };
+    GraphicsPipeline* const base = pipeline_cache.CurrentGraphicsPipeline();
+    if (!base || base->IsMeshPipeline()) {
+        return false;
+    }
+    const auto& regs = maxwell3d->regs;
+    // The stage that binds the patched constant buffer and addresses storage buffers through
+    // every patched slot.
+    size_t program = ~size_t{0};
+    size_t stage = 0;
+    u32 bank = 0;
+    for (size_t candidate = 1; candidate < Maxwell::MaxShaderProgram && program == ~size_t{0}; ++candidate) {
+        if (!regs.IsShaderConfigEnabled(candidate)) {
+            continue;
+        }
+        const size_t candidate_stage = candidate - 1;
+        const auto& info = base->StageInfos()[candidate_stage];
+        for (u32 b = 0; b < Maxwell::MaxConstBuffers; ++b) {
+            const auto& cbuf = maxwell3d->state.shader_stages[candidate_stage].const_buffers[b];
+            if (!cbuf.enabled || cbuf.address != pattern.cbuf_address) {
+                continue;
+            }
+            bool all = true;
+            for (u32 k = 0; k < pattern.num_slots; ++k) {
+                all &= std::ranges::any_of(info.storage_buffers_descriptors, [&](const auto& desc) {
+                    return desc.cbuf_index == b && desc.cbuf_offset == pattern.slots[k];
+                });
+            }
+            if (all) {
+                program = candidate;
+                stage = candidate_stage;
+                bank = b;
+                break;
+            }
+        }
+    }
+    if (program == ~size_t{0}) {
+        return false; // the patches feed something other than storage buffers: not ours
+    }
+    const auto& cbuf = maxwell3d->state.shader_stages[stage].const_buffers[bank];
+    if (cbuf.size == 0 || cbuf.size > Maxwell::MaxConstBufferSize) {
+        return fail("constant buffer size");
+    }
+    auto& batch = chunk_batch;
+    batch = {};
+    batch.cbuf_address = pattern.cbuf_address;
+    batch.cbuf_size = cbuf.size;
+    batch.program = program;
+    batch.stage = stage;
+    batch.bank = bank;
+    // Spans: windows around this draw's pointers.
+    for (u32 k = 0; k < pattern.num_slots; ++k) {
+        const GPUVAddr pointer = gpu_memory->Read<u64>(pattern.cbuf_address + pattern.slots[k]);
+        const u32 size = gpu_memory->Read<u32>(pattern.cbuf_address + pattern.slots[k] + 8);
+        const auto window = MappedWindow(*gpu_memory, pointer, (std::max)(size, 16U));
+        if (!window) {
+            return fail("storage buffer unmapped");
+        }
+        batch.span_base[k] = window->first;
+        batch.span_size[k] = window->second;
+        batch.table.slots[k] = {bank, pattern.slots[k]};
+    }
+    batch.table.num_slots = pattern.num_slots;
+    const u32 table_slot_offset = Common::AlignUp(cbuf.size, 16U);
+    batch.table.table_slot = {bank, table_slot_offset};
+    batch.table.stride = ChunkBatch::MaxSlots * sizeof(u32);
+    // Index window.
+    const auto& index_regs = regs.index_buffer;
+    const auto& draw_state = maxwell3d->draw_manager.draw_state;
+    batch.index_format = static_cast<u32>(index_regs.format);
+    batch.index_shift = batch.index_format == 0 ? 0 : batch.index_format == 1 ? 1 : 2;
+    const GPUVAddr index_address = index_regs.StartAddress();
+    const u64 index_need = u64{draw_state.index_buffer.first + draw_state.index_buffer.count} << batch.index_shift;
+    const auto index_window = MappedWindow(*gpu_memory, index_address, index_need);
+    if (!index_window) {
+        return fail("index buffer unmapped");
+    }
+    batch.index_base = index_window->first;
+    batch.index_size = index_window->second;
+    // Scratch: [constant buffer copy with span bases and the table pointer | table | commands].
+    const u32 copy_size = table_slot_offset + 16;
+    batch.table_offset = Common::AlignUp(copy_size, 256U);
+    batch.commands_offset = batch.table_offset + ChunkBatch::MaxDraws * batch.table.stride;
+    const u64 total = batch.commands_offset + u64{ChunkBatch::MaxDraws} * sizeof(VkDrawIndexedIndirectCommand);
+    batch.scratch = ReserveScratch(total);
+    if (batch.scratch == 0) {
+        return fail("no scratch");
+    }
+    batch.cbuf_copy.assign(copy_size, 0);
+    gpu_memory->ReadBlockUnsafe(pattern.cbuf_address, batch.cbuf_copy.data(), cbuf.size);
+    const auto put64 = [&](u32 at, u64 value) { std::memcpy(batch.cbuf_copy.data() + at, &value, sizeof(value)); };
+    for (u32 k = 0; k < pattern.num_slots; ++k) {
+        put64(pattern.slots[k], batch.span_base[k]);
+        put64(pattern.slots[k] + 8, batch.span_size[k]);
+    }
+    put64(table_slot_offset, batch.scratch + batch.table_offset);
+    put64(table_slot_offset + 8, u64{ChunkBatch::MaxDraws} * batch.table.stride);
+
+    // This draw's command, from the registers as the game left them (they are overridden below).
+    if (!ExtendChunkBatch(pattern)) {
+        return fail("first draw outside its windows");
+    }
+    GraphicsPipeline* const pipeline = pipeline_cache.BatchedGraphicsPipeline(program, batch.table);
+    if (!pipeline) {
+        return fail("no batched pipeline");
+    }
+    // Configure with the copy in the bank and the index window bound; the state the game set is
+    // restored afterwards and the index buffer marked dirty so the next draw re-binds its own.
+    FlushWork();
+    AccelerateInlineToMemory(batch.scratch, copy_size, batch.cbuf_copy);
+    gpu_memory->FlushCaching();
+    auto& bound_cbuf = maxwell3d->state.shader_stages[stage].const_buffers[bank];
+    const auto saved_cbuf = bound_cbuf;
+    auto& index_mut = maxwell3d->regs.index_buffer;
+    const auto saved_index = index_mut;
+    auto& draw_state_mut = maxwell3d->draw_manager.draw_state;
+    const auto saved_index_state = draw_state_mut.index_buffer;
+    SCOPE_EXIT {
+        bound_cbuf = saved_cbuf;
+        buffer_cache.BindGraphicsUniformBuffer(stage, bank, saved_cbuf.address, saved_cbuf.size);
+        index_mut = saved_index;
+        draw_state_mut.index_buffer = saved_index_state;
+        maxwell3d->dirty.flags[VideoCommon::Dirty::IndexBuffer] = true;
+    };
+    bound_cbuf = {.address = batch.scratch, .size = copy_size, .enabled = true};
+    buffer_cache.BindGraphicsUniformBuffer(stage, bank, batch.scratch, copy_size);
+    index_mut.start_addr_high = static_cast<u32>(batch.index_base >> 32);
+    index_mut.start_addr_low = static_cast<u32>(batch.index_base);
+    const GPUVAddr index_end = batch.index_base + batch.index_size - 1;
+    index_mut.limit_addr_high = static_cast<u32>(index_end >> 32);
+    index_mut.limit_addr_low = static_cast<u32>(index_end);
+    draw_state_mut.index_buffer.first = 0;
+    draw_state_mut.index_buffer.count = static_cast<u32>(batch.index_size >> batch.index_shift);
+    maxwell3d->dirty.flags[VideoCommon::Dirty::IndexBuffer] = true;
+    {
+        std::scoped_lock lock{buffer_cache.mutex, texture_cache.mutex};
+        // One cached buffer over the whole slot, so the table and command regions bound and
+        // uploaded later live in the buffer the descriptors point at.
+        [[maybe_unused]] const auto whole_slot = buffer_cache.ObtainBuffer(
+            batch.scratch, static_cast<u32>(total), VideoCommon::ObtainBufferSynchronize::NoSynchronize,
+            VideoCommon::ObtainBufferOperation::DoNothing);
+        pipeline->SetEngine(maxwell3d, gpu_memory);
+        if (!pipeline->Configure(true)) {
+            return fail("configure failed");
+        }
+        UpdateDynamicStates();
+        query_cache.NotifySegment(true);
+        batch.framebuffer = texture_cache.GetFramebuffer();
+    }
+    batch.active = true;
+    if (logged < 32) {
+        ++logged;
+        LOG_INFO(HW_GPU, "Chunk batch started: program slot {} bank {} cbuf {:#x} slots{} spans{} index window {:#x}+{:#x}",
+                 program, bank, pattern.cbuf_address,
+                 fmt::join(std::span{pattern.slots.data(), pattern.num_slots}, ","),
+                 fmt::join(std::span{batch.span_size.data(), pattern.num_slots}, ","),
+                 batch.index_base, batch.index_size);
+    }
+    return true;
+}
+
+bool RasterizerVulkan::ExtendChunkBatch(const ChunkPattern& pattern) {
+    auto& batch = chunk_batch;
+    if (pattern.cbuf_address != batch.cbuf_address || pattern.num_slots != batch.table.num_slots) {
+        return false;
+    }
+    for (u32 k = 0; k < pattern.num_slots; ++k) {
+        if (pattern.slots[k] != batch.table.slots[k].cbuf_offset) {
+            return false;
+        }
+    }
+    if (batch.commands.size() >= ChunkBatch::MaxDraws) {
+        return false;
+    }
+    const auto& regs = maxwell3d->regs;
+    const auto& draw_state = maxwell3d->draw_manager.draw_state;
+    if (static_cast<u32>(regs.index_buffer.format) != batch.index_format) {
+        return false;
+    }
+    const GPUVAddr index_address = regs.index_buffer.StartAddress();
+    const u64 index_need = u64{draw_state.index_buffer.first + draw_state.index_buffer.count} << batch.index_shift;
+    if (index_address < batch.index_base || index_address + index_need > batch.index_base + batch.index_size) {
+        return false;
+    }
+    std::array<u32, ChunkBatch::MaxSlots> deltas{};
+    for (u32 k = 0; k < pattern.num_slots; ++k) {
+        const GPUVAddr pointer = gpu_memory->Read<u64>(pattern.cbuf_address + pattern.slots[k]);
+        const u32 size = gpu_memory->Read<u32>(pattern.cbuf_address + pattern.slots[k] + 8);
+        if (pointer < batch.span_base[k] || pointer + size > batch.span_base[k] + batch.span_size[k]) {
+            return false;
+        }
+        deltas[k] = static_cast<u32>(pointer - batch.span_base[k]);
+    }
+    batch.rows.insert(batch.rows.end(), deltas.begin(), deltas.end());
+    batch.commands.push_back(VkDrawIndexedIndirectCommand{
+        .indexCount = draw_state.index_buffer.count,
+        .instanceCount = 1,
+        .firstIndex = static_cast<u32>((index_address - batch.index_base) >> batch.index_shift) + draw_state.index_buffer.first,
+        .vertexOffset = static_cast<s32>(draw_state.base_index),
+        .firstInstance = draw_state.base_instance,
+    });
+    return true;
+}
+
+void RasterizerVulkan::FlushChunkBatch() {
+    auto& batch = chunk_batch;
+    if (!batch.active) {
+        return;
+    }
+    batch.active = false;
+    const u32 count = static_cast<u32>(batch.commands.size());
+    if (count == 0) {
+        return;
+    }
+    // The table and the commands go through guest memory like any CPU-written buffer, then the
+    // range is obtained with synchronization so the upload is recorded before the draw.
+    const u32 rows_bytes = count * batch.table.stride;
+    const u32 commands_bytes = count * static_cast<u32>(sizeof(VkDrawIndexedIndirectCommand));
+    AccelerateInlineToMemory(batch.scratch + batch.table_offset, rows_bytes,
+                             std::span{reinterpret_cast<const u8*>(batch.rows.data()), rows_bytes});
+    AccelerateInlineToMemory(batch.scratch + batch.commands_offset, commands_bytes,
+                             std::span{reinterpret_cast<const u8*>(batch.commands.data()), commands_bytes});
+    gpu_memory->FlushCaching();
+    std::scoped_lock lock{buffer_cache.mutex, texture_cache.mutex};
+    const u32 upload_size = batch.commands_offset + commands_bytes - batch.table_offset;
+    [[maybe_unused]] const auto uploaded = buffer_cache.ObtainBuffer(
+        batch.scratch + batch.table_offset, upload_size,
+        VideoCommon::ObtainBufferSynchronize::FullSynchronize,
+        VideoCommon::ObtainBufferOperation::DoNothing);
+    const auto [buffer, offset] = buffer_cache.ObtainBuffer(
+        batch.scratch + batch.commands_offset, commands_bytes,
+        VideoCommon::ObtainBufferSynchronize::FullSynchronize,
+        VideoCommon::ObtainBufferOperation::DoNothing);
+    // The uploads may have left the render pass the batch was configured in.
+    scheduler.RequestRenderpass(batch.framebuffer);
+    scheduler.Record([handle = buffer->Handle(), offset, count](vk::CommandBuffer cmdbuf) {
+        cmdbuf.DrawIndexedIndirect(handle, offset, count, sizeof(VkDrawIndexedIndirectCommand));
+    });
+    static u64 batches{}, draws{};
+    static auto window = std::chrono::steady_clock::now();
+    ++batches;
+    draws += count;
+    if (const auto now = std::chrono::steady_clock::now(); now - window > std::chrono::seconds{10}) {
+        LOG_INFO(HW_GPU, "Chunk batches in the last 10 s: {} batches, {} draws ({:.0f} per batch)", batches,
+                 draws, batches ? static_cast<double>(draws) / static_cast<double>(batches) : 0.0);
+        batches = draws = 0;
+        window = now;
+    }
+    batch.commands.clear();
+    batch.rows.clear();
+    gpu.TickWork();
+}
+
+GPUVAddr RasterizerVulkan::ReserveScratch(u64 bytes) {
+    if (scratch_size == 0) {
+        const auto scratch = Service::Nvidia::Devices::GetNx2MeshScratch();
+        if (scratch.size == 0) {
+            return 0;
+        }
+        scratch_base = scratch.gpu_address;
+        scratch_size = scratch.size;
+    }
+    bytes = Common::AlignUp(bytes, 0x1000);
+    if (bytes > scratch_size) {
+        return 0;
+    }
+    if (scratch_next + bytes > scratch_size) {
+        scratch_next = 0;
+    }
+    const GPUVAddr address = scratch_base + scratch_next;
+    // The mapping lands on the GPU thread when the address space is created; until then, no.
+    if (!gpu_memory->IsFullyMappedRange(address, bytes)) {
+        return 0;
+    }
+    scratch_next += bytes;
+    return address;
+}
+
 bool RasterizerVulkan::DrawEmulatedMesh(const VideoCommon::Nx2MeshEmulation::DrawDescription& draw) {
     namespace ME = VideoCommon::Nx2MeshEmulation;
     using Layout = Shader::Ampere::MeshEmulation::Layout;
@@ -311,31 +706,15 @@ bool RasterizerVulkan::DrawEmulatedMesh(const VideoCommon::Nx2MeshEmulation::Dra
         }
         return false;
     };
-    if (mesh_scratch_size == 0) {
-        const auto scratch = Service::Nvidia::Devices::GetNx2MeshScratch();
-        if (scratch.size == 0) {
-            return fail("no scratch memory");
-        }
-        mesh_scratch_base = scratch.gpu_address;
-        mesh_scratch_size = scratch.size;
-    }
     const Layout layout{};
     const auto plan = ME::ScratchPlan::For(draw);
-    const u64 bytes = Common::AlignUp(plan.bytes, 0x1000);
-    if (bytes > mesh_scratch_size) {
-        return fail("draw larger than the scratch");
-    }
-    if (mesh_scratch_next + bytes > mesh_scratch_size) {
-        mesh_scratch_next = 0;
-    }
-    const GPUVAddr scratch = mesh_scratch_base + mesh_scratch_next;
-    if (!gpu_memory->IsFullyMappedRange(scratch, bytes)) {
-        return fail("scratch not mapped in this address space yet");
+    const GPUVAddr scratch = ReserveScratch(plan.bytes);
+    if (scratch == 0) {
+        return fail("no scratch memory for the draw");
     }
     if (!gpu_memory->IsFullyMappedRange(draw.mesh_program, 128)) {
         return fail("mesh program header unmapped");
     }
-    mesh_scratch_next += bytes;
     const auto& regs = maxwell3d->regs;
     static std::unordered_set<GPUVAddr> described;
     if (described.size() < 32 && described.insert(draw.mesh_program).second) {
@@ -697,6 +1076,14 @@ void RasterizerVulkan::RecordDrawStats(u64 draws, u64 vertices, bool indirect) {
 
 void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
     VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::Draw};
+    SCOPE_EXIT {
+        if (ChunkBatchingEnabled()) {
+            maxwell3d->ClearWritesSinceDraw();
+        }
+    };
+    if (TryBatchChunkDraw(is_indexed, instance_count)) {
+        return;
+    }
     TraceWindowTarget(*maxwell3d, *gpu_memory, is_indexed ? "draw-indexed" : "draw",
                       is_indexed ? maxwell3d->draw_manager.draw_state.index_buffer.count
                                  : maxwell3d->draw_manager.draw_state.vertex_buffer.count);
@@ -1338,6 +1725,9 @@ void RasterizerVulkan::Nx2DumpRenderTarget(bool after_draw) {
 }
 
 void RasterizerVulkan::DrawIndirect() {
+    if (chunk_batch.active) {
+        FlushChunkBatch();
+    }
     VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::Draw};
     const auto& params = maxwell3d->draw_manager.indirect_state;
     if (static const bool stats = std::getenv("EDEN_NX2_DRAW_STATS") != nullptr; stats) {
@@ -1408,6 +1798,9 @@ void RasterizerVulkan::DrawIndirect() {
 }
 
 void RasterizerVulkan::DrawTexture() {
+    if (chunk_batch.active) {
+        FlushChunkBatch();
+    }
 
     SCOPE_EXIT {
         gpu.TickWork();
@@ -1455,6 +1848,9 @@ void RasterizerVulkan::DrawTexture() {
 }
 
 void RasterizerVulkan::Clear(u32 layer_count) {
+    if (chunk_batch.active) {
+        FlushChunkBatch();
+    }
     VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::Clear};
     if (Tegra::Engines::g_nx2_trace_draws_after_upscale > 0) {
         const auto& regs = maxwell3d->regs;
@@ -1685,6 +2081,9 @@ void RasterizerVulkan::Clear(u32 layer_count) {
 }
 
 void RasterizerVulkan::DispatchCompute() {
+    if (chunk_batch.active) {
+        FlushChunkBatch();
+    }
     VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::Compute};
     if (frame_trace_state == 2) {
         const auto& qmd = kepler_compute->launch_description;
@@ -1773,6 +2172,9 @@ void RasterizerVulkan::ResetCounter(VideoCommon::QueryType type) {
 
 void RasterizerVulkan::Query(GPUVAddr gpu_addr, VideoCommon::QueryType type,
                              VideoCommon::QueryPropertiesFlags flags, u32 payload, u32 subreport) {
+    if (chunk_batch.active) {
+        FlushChunkBatch();
+    }
     query_cache.CounterReport(gpu_addr, type, flags, payload, subreport);
 }
 
@@ -1788,6 +2190,9 @@ void Vulkan::RasterizerVulkan::DisableGraphicsUniformBuffer(size_t stage, u32 in
 void RasterizerVulkan::FlushAll() {}
 
 void RasterizerVulkan::FlushRegion(DAddr addr, u64 size, VideoCommon::CacheType which) {
+    if (chunk_batch.active) {
+        FlushChunkBatch();
+    }
     if (addr == 0 || size == 0) {
         return;
     }
@@ -1838,6 +2243,9 @@ VideoCore::RasterizerDownloadArea RasterizerVulkan::GetFlushArea(DAddr addr, u64
 }
 
 void RasterizerVulkan::InvalidateRegion(DAddr addr, u64 size, VideoCommon::CacheType which) {
+    if (chunk_batch.active) {
+        FlushChunkBatch();
+    }
     if (addr == 0 || size == 0) {
         return;
     }
@@ -1895,6 +2303,9 @@ bool RasterizerVulkan::OnCPUWrite(DAddr addr, u64 size) {
 }
 
 void RasterizerVulkan::OnCacheInvalidation(DAddr addr, u64 size) {
+    if (chunk_batch.active) {
+        FlushChunkBatch();
+    }
     if (addr == 0 || size == 0) {
         return;
     }
@@ -1923,10 +2334,16 @@ bool RasterizerVulkan::TryCacheInvalidation(DAddr addr, u64 size) {
 }
 
 void RasterizerVulkan::InvalidateGPUCache() {
+    if (chunk_batch.active) {
+        FlushChunkBatch();
+    }
     gpu.InvalidateGPUCache();
 }
 
 void RasterizerVulkan::UnmapMemory(DAddr addr, u64 size) {
+    if (chunk_batch.active) {
+        FlushChunkBatch();
+    }
     {
         std::scoped_lock lock{texture_cache.mutex};
         texture_cache.UnmapMemory(addr, size);
@@ -1939,6 +2356,9 @@ void RasterizerVulkan::UnmapMemory(DAddr addr, u64 size) {
 }
 
 void RasterizerVulkan::ModifyGPUMemory(size_t as_id, GPUVAddr addr, u64 size) {
+    if (chunk_batch.active) {
+        FlushChunkBatch();
+    }
     {
         std::scoped_lock lock{texture_cache.mutex};
         texture_cache.UnmapGPUMemory(as_id, addr, size);
@@ -1947,27 +2367,45 @@ void RasterizerVulkan::ModifyGPUMemory(size_t as_id, GPUVAddr addr, u64 size) {
 }
 
 void RasterizerVulkan::SignalFence(std::function<void()>&& func) {
+    if (chunk_batch.active) {
+        FlushChunkBatch();
+    }
     fence_manager.SignalFence(std::move(func));
 }
 
 void RasterizerVulkan::SyncOperation(std::function<void()>&& func) {
+    if (chunk_batch.active) {
+        FlushChunkBatch();
+    }
     fence_manager.SyncOperation(std::move(func));
 }
 
 void RasterizerVulkan::SignalSyncPoint(u32 value) {
+    if (chunk_batch.active) {
+        FlushChunkBatch();
+    }
     fence_manager.SignalSyncPoint(value);
 }
 
 void RasterizerVulkan::SignalReference() {
+    if (chunk_batch.active) {
+        FlushChunkBatch();
+    }
     fence_manager.SignalReference();
 }
 
 void RasterizerVulkan::ReleaseFences(bool force) {
+    if (chunk_batch.active) {
+        FlushChunkBatch();
+    }
     fence_manager.WaitPendingFences(force);
 }
 
 void RasterizerVulkan::FlushAndInvalidateRegion(DAddr addr, u64 size,
                                                 VideoCommon::CacheType which) {
+    if (chunk_batch.active) {
+        FlushChunkBatch();
+    }
     if (Settings::IsGPULevelHigh()) {
         FlushRegion(addr, size, which);
     }
@@ -1975,6 +2413,9 @@ void RasterizerVulkan::FlushAndInvalidateRegion(DAddr addr, u64 size,
 }
 
 void RasterizerVulkan::WaitForIdle() {
+    if (chunk_batch.active) {
+        FlushChunkBatch();
+    }
     // Everything but wait pixel operations. This intentionally includes FRAGMENT_SHADER_BIT because
     // fragment shaders can still write storage buffers.
     VkPipelineStageFlags flags =
@@ -1998,15 +2439,24 @@ void RasterizerVulkan::WaitForIdle() {
 }
 
 void RasterizerVulkan::FragmentBarrier() {
+    if (chunk_batch.active) {
+        FlushChunkBatch();
+    }
     // We already put barriers when a render pass finishes
     scheduler.RequestOutsideRenderPassOperationContext();
 }
 
 void RasterizerVulkan::TiledCacheBarrier() {
+    if (chunk_batch.active) {
+        FlushChunkBatch();
+    }
     // TODO: Implementing tiled barriers requires rewriting a good chunk of the Vulkan backend
 }
 
 void RasterizerVulkan::FlushCommands() {
+    if (chunk_batch.active) {
+        FlushChunkBatch();
+    }
     if (draw_counter == 0) {
         return;
     }
@@ -2015,6 +2465,9 @@ void RasterizerVulkan::FlushCommands() {
 }
 
 void RasterizerVulkan::TickFrame() {
+    if (chunk_batch.active) {
+        FlushChunkBatch();
+    }
     draw_counter = 0;
     ++frame_counter;
     // EDEN_NX2_TRACE_TRIGGER=<path>: trace the frame after that file appears (`touch` it from
@@ -2114,6 +2567,9 @@ Tegra::Engines::AccelerateDMAInterface& RasterizerVulkan::AccessAccelerateDMA() 
 
 void RasterizerVulkan::AccelerateInlineToMemory(GPUVAddr address, size_t copy_size,
                                                 std::span<const u8> memory) {
+    if (chunk_batch.active) {
+        FlushChunkBatch();
+    }
     auto cpu_addr = gpu_memory->GpuToCpuAddress(address);
     if (gpu_memory->UsesNativeTiling()) {
         u32 first_word{};

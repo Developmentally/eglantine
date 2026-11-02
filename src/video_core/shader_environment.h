@@ -86,6 +86,11 @@ public:
         return has_hle_engine_state;
     }
 
+    /// Batched draws: translate with per-draw storage buffer offsets (DrawTablePass).
+    void SetDrawTable(const Shader::Environment::DrawTable& table) {
+        draw_table = table;
+    }
+
 protected:
     std::optional<u64> TryFindSize();
 

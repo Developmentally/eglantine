@@ -618,6 +618,29 @@ ComputePipeline* PipelineCache::CurrentComputePipeline() {
     return pipeline.get();
 }
 
+GraphicsPipeline* PipelineCache::BatchedGraphicsPipeline(
+    size_t program, const Shader::Environment::DrawTable& table) try {
+    if (!RefreshStages(graphics_key.unique_hashes)) {
+        return nullptr;
+    }
+    graphics_key.state.Refresh(*maxwell3d, dynamic_features);
+    const BatchedKey batched_key{.key = graphics_key, .program = program, .table = table};
+    const auto [pair, is_new] = batched_graphics_cache.try_emplace(batched_key);
+    auto& pipeline = pair->second;
+    if (!is_new) {
+        return pipeline.get();
+    }
+    GraphicsEnvironments environments;
+    GetGraphicsEnvironments(environments, graphics_key.unique_hashes);
+    environments.envs[program].SetDrawTable(table);
+    main_pools.ReleaseContents();
+    pipeline = CreateGraphicsPipeline(main_pools, graphics_key, environments.Span(), nullptr, false);
+    return pipeline.get();
+} catch (const Shader::Exception& exception) {
+    LOG_ERROR(Render_Vulkan, "Batched pipeline: {}", exception.what());
+    return nullptr;
+}
+
 ComputePipeline* PipelineCache::MeshEmulationComputePipeline(GPUVAddr program, bool has_task,
                                                              u32 threads) {
     // Keyed apart from the shader cache, whose memo for this very address holds its rejection

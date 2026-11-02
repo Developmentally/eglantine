@@ -26,9 +26,15 @@ Nx2MeshScratch GetNx2MeshScratch() {
 
 void EnsureNx2MeshScratch(Core::System& system) {
     using Core::Memory::YUZU_PAGESIZE;
+    // Users of the scratch: the task/mesh emulation and the batched chunk draws.
     static const bool enabled = [] {
-        const char* value = std::getenv("EDEN_NX2_MESH_EMU");
-        return value != nullptr && value[0] == '1';
+        for (const char* name : {"EDEN_NX2_MESH_EMU", "EDEN_NX2_CHUNK_BATCH"}) {
+            const char* value = std::getenv(name);
+            if (value != nullptr && value[0] == '1') {
+                return true;
+            }
+        }
+        return false;
     }();
     if (!enabled) {
         return;

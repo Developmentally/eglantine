@@ -18,15 +18,16 @@ namespace Service::Nvidia::Devices {
 bool IsNx2GpuOnlyAddress(u64 gpu_address);
 
 // The emulator's own guest-visible memory for the task/mesh emulation (EDEN_NX2_MESH_EMU=1;
-// video_core/nx2_mesh_emulation.h): kernel pages mapped into the application and at a fixed GPU
-// address in every Switch 2 GPU address space. Zero until the address space exists.
+// video_core/nx2_mesh_emulation.h) and the batched chunk draws (EDEN_NX2_CHUNK_BATCH=1): kernel
+// pages mapped into the application and at a fixed GPU address in every Switch 2 GPU address
+// space. Zero until the address space exists.
 struct Nx2MeshScratch {
     u64 gpu_address{};
     u64 size{};
 };
 Nx2MeshScratch GetNx2MeshScratch();
 
-// Allocates and maps the scratch once per session; a no-op unless EDEN_NX2_MESH_EMU=1.
+// Allocates and maps the scratch once per session; a no-op unless a user of it is enabled.
 void EnsureNx2MeshScratch(Core::System& system);
 
 } // namespace Service::Nvidia::Devices

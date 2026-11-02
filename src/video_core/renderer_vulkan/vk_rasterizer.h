@@ -7,6 +7,8 @@
 #pragma once
 
 #include <array>
+#include <optional>
+#include <vector>
 #include <unordered_map>
 
 #include <boost/container/static_vector.hpp>
@@ -15,6 +17,7 @@
 #include "video_core/control/channel_state_cache.h"
 #include "video_core/engines/maxwell_dma.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
+#include "shader_recompiler/environment.h"
 #include "video_core/nx2_mesh_emulation.h"
 #include "video_core/rasterizer_interface.h"
 #include "video_core/renderer_vulkan/blit_image.h"
@@ -169,6 +172,51 @@ private:
     /// rewritten compute programs over the scratch and a replay draw. True when submitted.
     bool DrawEmulatedMesh(const VideoCommon::Nx2MeshEmulation::DrawDescription& draw);
 
+    /// Emulator scratch (guest-visible GPU memory, nx2_gpu_memory.h): `bytes` of it, rung
+    /// through; 0 when there is none or it is not mapped in this address space yet.
+    GPUVAddr ReserveScratch(u64 bytes);
+
+    // Batched chunk draws (EDEN_NX2_CHUNK_BATCH=1): a run of indexed draws that differ only in
+    // storage buffer pointers patched into one constant buffer and in their index range is drawn
+    // as one vkCmdDrawIndexedIndirect, the pointers moved into a gl_DrawID-indexed table of
+    // offsets (DrawTablePass). Title 4 draws its terrain this way: 7,600 chunks a frame.
+    struct ChunkBatch {
+        static constexpr u32 MaxDraws = 4096;
+        static constexpr u32 MaxSlots = 4;
+        bool active{};
+        GPUVAddr cbuf_address{};  ///< the patched constant buffer (CB_ADDRESS of the pattern)
+        u32 cbuf_size{};
+        size_t program{};         ///< program slot whose bank it is
+        size_t stage{};           ///< its stage index
+        u32 bank{};
+        Shader::Environment::DrawTable table{};
+        std::array<GPUVAddr, MaxSlots> span_base{};
+        std::array<u64, MaxSlots> span_size{};
+        GPUVAddr index_base{};
+        u64 index_size{};
+        u32 index_shift{};
+        u32 index_format{};
+        GPUVAddr scratch{};       ///< [cbuf copy | table | indirect commands]
+        u32 table_offset{};
+        u32 commands_offset{};
+        std::vector<u8> cbuf_copy;
+        std::vector<u32> rows;    ///< MaxSlots u32 per draw
+        std::vector<VkDrawIndexedIndirectCommand> commands;
+        const Framebuffer* framebuffer{};
+    } chunk_batch;
+    /// The pattern of register writes since the previous draw, if it is a chunk patch.
+    struct ChunkPattern {
+        GPUVAddr cbuf_address{};
+        std::array<u32, ChunkBatch::MaxSlots> slots{};
+        u32 num_slots{};
+    };
+    [[nodiscard]] std::optional<ChunkPattern> MatchChunkPattern() const;
+    /// True when the current draw was taken into a batch (begun or extended).
+    bool TryBatchChunkDraw(bool is_indexed, u32 instance_count);
+    bool BeginChunkBatch(const ChunkPattern& pattern);
+    bool ExtendChunkBatch(const ChunkPattern& pattern);
+    void FlushChunkBatch();
+
     void FlushWork();
 
     void UpdateDynamicStates();
@@ -259,10 +307,10 @@ private:
     u32 frame_counter = 0;
     u32 frame_trace_state = 0;
     u32 traced_image_frame = 0;
-    // Task/mesh emulation scratch: the session's region, rung through per draw.
-    GPUVAddr mesh_scratch_base = 0;
-    u64 mesh_scratch_size = 0;
-    u64 mesh_scratch_next = 0;
+    // Emulator scratch: the session's region, rung through (ReserveScratch).
+    GPUVAddr scratch_base = 0;
+    u64 scratch_size = 0;
+    u64 scratch_next = 0;
     bool bias_vs_active = false;
     std::unordered_map<u64, u32> vs_dump_counts;
     bool mesh_draw{}; ///< the draw being prepared uses a task/mesh pipeline
