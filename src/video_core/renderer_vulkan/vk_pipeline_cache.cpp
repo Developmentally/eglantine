@@ -632,7 +632,35 @@ GraphicsPipeline* PipelineCache::BatchedGraphicsPipeline(
     }
     GraphicsEnvironments environments;
     GetGraphicsEnvironments(environments, graphics_key.unique_hashes);
-    environments.envs[program].SetDrawTable(table);
+    Shader::Environment::DrawTable stage_table{table};
+    if (program != 1) {
+        // Only the vertex stage has a draw index of its own: the vertex program forwards it on a
+        // generic attribute neither it nor the patched stage uses (the stages between them, if
+        // any, would have to pass it on too; not supported).
+        if (current_pipeline == nullptr || program != 4 || graphics_key.unique_hashes[2] != 0 ||
+            graphics_key.unique_hashes[3] != 0) {
+            return nullptr;
+        }
+        const auto& infos{current_pipeline->StageInfos()};
+        u32 attribute{~0U};
+        for (u32 generic = 31; generic != ~0U; --generic) {
+            const auto base{static_cast<Shader::IR::Attribute>(
+                static_cast<u32>(Shader::IR::Attribute::Generic0X) + generic * 4)};
+            if (!infos[0].stores.AnyComponent(base) && !infos[program - 1].loads.AnyComponent(base)) {
+                attribute = generic;
+                break;
+            }
+        }
+        if (attribute == ~0U) {
+            return nullptr;
+        }
+        stage_table.draw_id_attribute = attribute;
+        Shader::Environment::DrawTable vertex_table{};
+        vertex_table.draw_id_attribute = attribute;
+        vertex_table.forward_draw_id = true;
+        environments.envs[1].SetDrawTable(vertex_table);
+    }
+    environments.envs[program].SetDrawTable(stage_table);
     main_pools.ReleaseContents();
     pipeline = CreateGraphicsPipeline(main_pools, graphics_key, environments.Span(), nullptr, false);
     return pipeline.get();

@@ -69,11 +69,27 @@ bool IsStorageAccess(IR::Opcode opcode) {
         return false;
     }
 }
+
+IR::Attribute DrawIdAttribute(u32 generic) {
+    return static_cast<IR::Attribute>(static_cast<u32>(IR::Attribute::Generic0X) + generic * 4);
+}
 } // Anonymous namespace
 
 void DrawTablePass(Environment& env, IR::Program& program) {
     const auto& table{env.GetDrawTable()};
     if (!table.Enabled()) {
+        return;
+    }
+    if (table.forward_draw_id) {
+        // Vertex program of a batched pipeline: gl_DrawID goes out as a flat varying for the
+        // patched stage. Stored at the entry; outputs have no ordering.
+        IR::Block* const entry{program.blocks.front()};
+        IR::IREmitter ir{*entry, entry->begin()};
+        const IR::U32 draw_id{ir.GetAttributeU32(IR::Attribute::DrawID)};
+        ir.SetAttribute(DrawIdAttribute(table.draw_id_attribute), ir.BitCast<IR::F32>(draw_id),
+                        ir.Imm32(0));
+    }
+    if (table.num_slots == 0) {
         return;
     }
     auto& descriptors{program.info.storage_buffers_descriptors};
@@ -117,7 +133,10 @@ void DrawTablePass(Environment& env, IR::Program& program) {
             }
             const u32 column{*column_of_binding[binding]};
             IR::IREmitter ir{*block, IR::Block::InstructionList::s_iterator_to(inst)};
-            const IR::U32 draw_id{ir.GetAttributeU32(IR::Attribute::DrawID)};
+            const IR::U32 draw_id{
+                table.draw_id_attribute == ~0U
+                    ? ir.GetAttributeU32(IR::Attribute::DrawID)
+                    : ir.BitCast<IR::U32>(ir.GetAttribute(DrawIdAttribute(table.draw_id_attribute), ir.Imm32(0)))};
             const IR::U32 row{ir.IMul(draw_id, ir.Imm32(table.stride))};
             const IR::U32 delta_offset{ir.IAdd(row, ir.Imm32(column * 4))};
             const IR::Value delta{&*block->PrependNewInst(

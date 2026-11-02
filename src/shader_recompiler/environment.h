@@ -145,9 +145,15 @@ public:
         u32 num_slots{};
         Slot table_slot{};
         u32 stride{};
+        /// Generic attribute (0-31) through which the vertex program forwards gl_DrawID to a
+        /// later stage that is patched (hosts give geometry programs no draw index of their
+        /// own); ~0 when the patched stage reads gl_DrawID itself.
+        u32 draw_id_attribute{~0U};
+        /// Set on the vertex program's environment: forward gl_DrawID on `draw_id_attribute`.
+        bool forward_draw_id{};
 
         [[nodiscard]] bool Enabled() const noexcept {
-            return num_slots != 0;
+            return num_slots != 0 || forward_draw_id;
         }
     };
 

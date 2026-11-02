@@ -423,12 +423,21 @@ bool RasterizerVulkan::BeginChunkBatch(const ChunkPattern& pattern) {
         return false;
     }
     const auto& regs = maxwell3d->regs;
+    const GPUVAddr vertex_program =
+        (u64{regs.pipelines[1].reserved[0] & 0xff} << 32) | regs.pipelines[1].reserved[1];
+    // Title 4's indirect-record reset program is run on the CPU (ResetIndirectRecordsOnCpu).
+    if (maxwell3d->IsIndirectResetProgram(vertex_program)) {
+        return false;
+    }
     // The stage that binds the patched constant buffer and addresses storage buffers through
     // every patched slot.
     size_t program = ~size_t{0};
     size_t stage = 0;
     u32 bank = 0;
-    for (size_t candidate = 1; candidate < Maxwell::MaxShaderProgram && program == ~size_t{0}; ++candidate) {
+    // The vertex slot is left alone for now: a vertex program with gl_DrawID and no outputs
+    // crashed the host driver's pipeline compiler (title 4's reset program); the chunk passes
+    // patch the geometry stage.
+    for (size_t candidate = 2; candidate < Maxwell::MaxShaderProgram && program == ~size_t{0}; ++candidate) {
         if (!regs.IsShaderConfigEnabled(candidate)) {
             continue;
         }
@@ -569,8 +578,8 @@ bool RasterizerVulkan::BeginChunkBatch(const ChunkPattern& pattern) {
     batch.active = true;
     if (logged < 32) {
         ++logged;
-        LOG_INFO(HW_GPU, "Chunk batch started: program slot {} bank {} cbuf {:#x} slots{} spans{} index window {:#x}+{:#x}",
-                 program, bank, pattern.cbuf_address,
+        LOG_INFO(HW_GPU, "Chunk batch started: vs {:#x} program slot {} bank {} cbuf {:#x} slots{} spans{} index window {:#x}+{:#x}",
+                 vertex_program, program, bank, pattern.cbuf_address,
                  fmt::join(std::span{pattern.slots.data(), pattern.num_slots}, ","),
                  fmt::join(std::span{batch.span_size.data(), pattern.num_slots}, ","),
                  batch.index_base, batch.index_size);

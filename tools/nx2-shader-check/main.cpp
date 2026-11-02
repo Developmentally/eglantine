@@ -15,7 +15,9 @@
 //                  status then reports only new failures, and fixed programs are listed
 //     -t <spec>    draw table: "<cb>:<hex off>[,<cb>:<hex off>...]@<cb>:<hex off>" patches the
 //                  storage buffers at those cbuf slots per gl_DrawID through a table at the
-//                  last slot (Environment::DrawTable), to check the batched-draw variant
+//                  last slot (Environment::DrawTable), to check the batched-draw variant;
+//                  "@<cb>:<off>#<n>" reads the draw index from generic attribute n instead
+//     -f <n>       vertex program of a batched pipeline: forward gl_DrawID on generic n
 
 #include <algorithm>
 #include <cstdio>
@@ -402,8 +404,19 @@ int main(int argc, char** argv) {
                 draw_table_spec.slots[draw_table_spec.num_slots++] = parse_slot(slots.substr(0, comma));
                 slots = comma == std::string_view::npos ? std::string_view{} : slots.substr(comma + 1);
             }
-            draw_table_spec.table_slot = parse_slot(std::string_view{spec}.substr(at + 1));
+            std::string_view table{std::string_view{spec}.substr(at + 1)};
+            if (const size_t hash = table.find('#'); hash != std::string_view::npos) {
+                // "#<n>": the patched stage reads the draw index from generic attribute n.
+                draw_table_spec.draw_id_attribute = static_cast<u32>(std::stoul(std::string{table.substr(hash + 1)}));
+                table = table.substr(0, hash);
+            }
+            draw_table_spec.table_slot = parse_slot(table);
             draw_table_spec.stride = 16;
+        }
+        else if (arg == "-f" && i + 1 < argc) {
+            // Vertex program of a batched pipeline: forward gl_DrawID on generic attribute n.
+            draw_table_spec.draw_id_attribute = static_cast<u32>(std::stoul(argv[++i]));
+            draw_table_spec.forward_draw_id = true;
         }
         else inputs.emplace_back(arg);
     }
