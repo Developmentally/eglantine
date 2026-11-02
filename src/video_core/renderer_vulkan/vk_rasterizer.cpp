@@ -815,6 +815,9 @@ void RasterizerVulkan::DrawChunkBatch(ChunkBatch& batch) {
         batch.scratch + batch.commands_offset, commands_bytes,
         VideoCommon::ObtainBufferSynchronize::NoSynchronize,
         VideoCommon::ObtainBufferOperation::DoNothing);
+    // Read by the indirect draw, which no bind records: without this, the next upload into the
+    // same ring slot is free to move to the upload command buffer, ahead of this draw.
+    buffer->MarkUsage(offset, commands_bytes);
     scheduler.RequestRenderpass(texture_cache.GetFramebuffer());
     scheduler.Record([handle = buffer->Handle(), offset, count](vk::CommandBuffer cmdbuf) {
         cmdbuf.DrawIndexedIndirect(handle, offset, count, sizeof(VkDrawIndexedIndirectCommand));
