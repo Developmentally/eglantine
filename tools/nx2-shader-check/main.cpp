@@ -13,6 +13,9 @@
 //     -d           dump the IR of each program after translation
 //     -b <file>    baseline: one program file name per line that is allowed to fail; the exit
 //                  status then reports only new failures, and fixed programs are listed
+//     -t <spec>    draw table: "<cb>:<hex off>[,<cb>:<hex off>...]@<cb>:<hex off>" patches the
+//                  storage buffers at those cbuf slots per gl_DrawID through a table at the
+//                  last slot (Environment::DrawTable), to check the batched-draw variant
 
 #include <algorithm>
 #include <cstdio>
@@ -52,6 +55,7 @@ namespace fs = std::filesystem;
 bool verbose = false;
 bool dump_ir = false;
 fs::path spirv_output;
+Shader::Environment::DrawTable draw_table_spec;
 using Shader::Ampere::Instruction;
 using Shader::Ampere::ProgramDumpInfo;
 
@@ -63,6 +67,7 @@ public:
                     std::span<const Instruction> native) {
         stage = static_cast<Shader::Stage>(info.stage);
         gp_passthrough_mask = info.gp_passthrough_mask;
+        draw_table = draw_table_spec;
         // Task and mesh programs are dumped from the vertex slot; the dump carries neither the
         // mesh registers nor the per-primitive header, so translate them with the shape the
         // title's programs have: 32 lanes, triangles, 4 vertices and 2 primitives per lane.
@@ -381,6 +386,25 @@ int main(int argc, char** argv) {
         else if (arg == "-d") dump_ir = verbose = true;
         else if (arg == "-b" && i + 1 < argc) baseline_path = argv[++i];
         else if (arg == "-s" && i + 1 < argc) spirv_output = argv[++i];
+        else if (arg == "-t" && i + 1 < argc) {
+            const std::string spec{argv[++i]};
+            const auto parse_slot = [](std::string_view text) {
+                const size_t colon = text.find(':');
+                return Shader::Environment::DrawTable::Slot{
+                    static_cast<u32>(std::stoul(std::string{text.substr(0, colon)})),
+                    static_cast<u32>(std::stoul(std::string{text.substr(colon + 1)}, nullptr, 16))};
+            };
+            const size_t at = spec.find('@');
+            std::string_view slots{spec};
+            slots = slots.substr(0, at);
+            while (!slots.empty() && draw_table_spec.num_slots < draw_table_spec.slots.size()) {
+                const size_t comma = slots.find(',');
+                draw_table_spec.slots[draw_table_spec.num_slots++] = parse_slot(slots.substr(0, comma));
+                slots = comma == std::string_view::npos ? std::string_view{} : slots.substr(comma + 1);
+            }
+            draw_table_spec.table_slot = parse_slot(std::string_view{spec}.substr(at + 1));
+            draw_table_spec.stride = 16;
+        }
         else inputs.emplace_back(arg);
     }
     if (inputs.empty()) {

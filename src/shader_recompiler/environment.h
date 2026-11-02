@@ -132,11 +132,35 @@ public:
         return mesh_primitive_header;
     }
 
+    /// Batched draws: storage buffers whose pointer lives at one of `slots` are addressed per
+    /// draw. The host binds a span covering every draw's buffer at the slot and a table of
+    /// `u32 delta[slots]` rows, `stride` bytes apart, at the pointer in `table_slot`; the
+    /// program adds `row[gl_DrawID].delta[i]` to each access through slot i.
+    struct DrawTable {
+        struct Slot {
+            u32 cbuf_index;
+            u32 cbuf_offset;
+        };
+        std::array<Slot, 4> slots{};
+        u32 num_slots{};
+        Slot table_slot{};
+        u32 stride{};
+
+        [[nodiscard]] bool Enabled() const noexcept {
+            return num_slots != 0;
+        }
+    };
+
+    [[nodiscard]] const DrawTable& GetDrawTable() const noexcept {
+        return draw_table;
+    }
+
 protected:
     ProgramHeader sph{};
     std::array<u32, 8> gp_passthrough_mask{};
     std::array<u32, 3> mesh_registers{};
     ProgramHeader mesh_primitive_header{};
+    DrawTable draw_table{};
     Stage stage{};
     u32 start_address{};
     bool is_proprietary_driver{};
