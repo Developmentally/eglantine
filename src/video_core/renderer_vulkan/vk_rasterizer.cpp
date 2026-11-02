@@ -459,7 +459,15 @@ bool RasterizerVulkan::TryBatchChunkDraw(bool is_indexed, u32 instance_count) {
         ++(pattern ? chunk_batch_stats.ended_by_miss : chunk_batch_stats.ended_by_draw);
         FlushChunkBatches();
     }
-    return pattern && BeginChunkBatch(*pattern);
+    if (!pattern || !BeginChunkBatch(*pattern)) {
+        return false;
+    }
+    // EDEN_NX2_CHUNK_BATCH_EAGER=1: draw each batch as soon as it opens (experiments).
+    static const bool eager = std::getenv("EDEN_NX2_CHUNK_BATCH_EAGER") != nullptr;
+    if (eager) {
+        FlushChunkBatches();
+    }
+    return true;
 }
 
 std::optional<std::pair<GPUVAddr, u64>> RasterizerVulkan::ChunkWindow(GPUVAddr pointer, u64 need) {
