@@ -7,6 +7,7 @@
 #pragma once
 
 #include <array>
+#include <chrono>
 #include <optional>
 #include <vector>
 #include <unordered_map>
@@ -204,6 +205,13 @@ private:
         std::vector<VkDrawIndexedIndirectCommand> commands;
         const Framebuffer* framebuffer{};
     } chunk_batch;
+    struct ChunkBatchStats {
+        std::chrono::steady_clock::time_point window{std::chrono::steady_clock::now()};
+        u64 batches{};
+        u64 draws{};
+        u64 ended_by_miss{};  ///< a chunk draw whose records or indices fell outside the windows
+        u64 ended_by_draw{};  ///< a draw that is not a chunk draw
+    } chunk_batch_stats;
     /// The pattern of register writes since the previous draw, if it is a chunk patch.
     struct ChunkPattern {
         GPUVAddr cbuf_address{};

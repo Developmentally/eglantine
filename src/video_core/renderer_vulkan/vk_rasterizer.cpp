@@ -309,23 +309,48 @@ bool ChunkBatchingEnabled() {
     return enabled;
 }
 
-// A window of mapped memory around `pointer` that holds [pointer, pointer + need): as large as
-// 32 MiB so that the following chunks fall inside it too, or just the range itself.
+// A window of memory around `pointer` that holds [pointer, pointer + need), as large as 32 MiB so
+// that the following chunks fall inside it too. The window is one continuous mapping: a storage
+// buffer bound at its base is sized from the mapping the base is in, so a window straddling two
+// allocations would end before the pointer.
 std::optional<std::pair<GPUVAddr, u64>> MappedWindow(const Tegra::MemoryManager& gpu_memory,
                                                      GPUVAddr pointer, u64 need) {
-    constexpr u64 Alignment = 0x10000;
-    for (const u64 size : {u64{32} << 20, u64{8} << 20, u64{2} << 20}) {
-        const GPUVAddr base = Common::AlignDown(pointer - (std::min)(pointer, size / 4), Alignment);
-        if (pointer + need <= base + size && gpu_memory.IsFullyMappedRange(base, size)) {
-            return std::pair{base, size};
+    constexpr u64 Granule = 0x10000;
+    constexpr u64 MaxWindow = u64{32} << 20;
+    constexpr u64 MaxBefore = u64{8} << 20;
+    const u64 forward = gpu_memory.GetMemoryLayoutSize(pointer);
+    if (forward < need) {
+        return std::nullopt;
+    }
+    // The lowest granule-aligned base whose mapping still reaches the pointer (monotonic in base).
+    const GPUVAddr top = Common::AlignDown(pointer, Granule);
+    GPUVAddr lo = top - (std::min)(top, MaxBefore);
+    GPUVAddr hi = top;
+    while (lo < hi) {
+        const GPUVAddr mid = lo + Common::AlignDown((hi - lo) / 2, Granule);
+        if (gpu_memory.GetMemoryLayoutSize(mid) >= pointer + need - mid) {
+            hi = mid;
+        } else {
+            lo = mid + Granule;
         }
     }
-    const GPUVAddr base = Common::AlignDown(pointer, 0x1000);
-    const u64 size = Common::AlignUp(pointer + need - base, 0x1000);
-    if (gpu_memory.IsFullyMappedRange(base, size)) {
-        return std::pair{base, size};
+    GPUVAddr base = hi;
+    u64 size = Common::AlignDown((std::min)(pointer + forward, base + MaxWindow) - base, 0x1000);
+    // Device memory behind the window must be contiguous as well; shrink towards the pointer
+    // until it is.
+    while (!gpu_memory.IsContinuousRange(base, size)) {
+        const GPUVAddr new_base = Common::AlignDown(base + (pointer - base) / 2, 0x1000);
+        const u64 new_end = Common::AlignUp(pointer + need + (base + size - pointer - need) / 2, 0x1000);
+        if (new_base == base && new_end == base + size) {
+            return std::nullopt;
+        }
+        base = new_base;
+        size = new_end - base;
     }
-    return std::nullopt;
+    if (pointer + need > base + size) {
+        return std::nullopt;
+    }
+    return std::pair{base, size};
 }
 } // Anonymous namespace
 
@@ -404,6 +429,7 @@ bool RasterizerVulkan::TryBatchChunkDraw(bool is_indexed, u32 instance_count) {
         if (pattern && ExtendChunkBatch(*pattern)) {
             return true;
         }
+        ++(pattern ? chunk_batch_stats.ended_by_miss : chunk_batch_stats.ended_by_draw);
         FlushChunkBatch();
     }
     return pattern && BeginChunkBatch(*pattern);
@@ -664,15 +690,18 @@ void RasterizerVulkan::FlushChunkBatch() {
     scheduler.Record([handle = buffer->Handle(), offset, count](vk::CommandBuffer cmdbuf) {
         cmdbuf.DrawIndexedIndirect(handle, offset, count, sizeof(VkDrawIndexedIndirectCommand));
     });
-    static u64 batches{}, draws{};
-    static auto window = std::chrono::steady_clock::now();
-    ++batches;
-    draws += count;
-    if (const auto now = std::chrono::steady_clock::now(); now - window > std::chrono::seconds{10}) {
-        LOG_INFO(HW_GPU, "Chunk batches in the last 10 s: {} batches, {} draws ({:.0f} per batch)", batches,
-                 draws, batches ? static_cast<double>(draws) / static_cast<double>(batches) : 0.0);
-        batches = draws = 0;
-        window = now;
+    auto& stats = chunk_batch_stats;
+    ++stats.batches;
+    stats.draws += count;
+    if (const auto now = std::chrono::steady_clock::now(); now - stats.window > std::chrono::seconds{10}) {
+        LOG_INFO(HW_GPU,
+                 "Chunk batches in the last 10 s: {} batches, {} draws ({:.0f} per batch); ended by "
+                 "a chunk outside the windows {}, by another draw {}, by other work {}",
+                 stats.batches, stats.draws,
+                 stats.batches ? static_cast<double>(stats.draws) / static_cast<double>(stats.batches) : 0.0,
+                 stats.ended_by_miss, stats.ended_by_draw,
+                 stats.batches - stats.ended_by_miss - stats.ended_by_draw);
+        stats = {.window = now};
     }
     batch.commands.clear();
     batch.rows.clear();
