@@ -449,7 +449,13 @@ bool RasterizerVulkan::TryBatchChunkDraw(bool is_indexed, u32 instance_count) {
             }
         }
     }
-    if (!chunk_batches.empty() && (!pattern || chunk_batches.size() == MaxOpenChunkBatches)) {
+    // EDEN_NX2_CHUNK_BATCH_OPEN: batches open at once (experiments).
+    static const size_t max_open = [] {
+        const char* value = std::getenv("EDEN_NX2_CHUNK_BATCH_OPEN");
+        const size_t n = value ? static_cast<size_t>(std::strtoul(value, nullptr, 10)) : MaxOpenChunkBatches;
+        return std::clamp<size_t>(n, 1, MaxOpenChunkBatches);
+    }();
+    if (!chunk_batches.empty() && (!pattern || chunk_batches.size() >= max_open)) {
         ++(pattern ? chunk_batch_stats.ended_by_miss : chunk_batch_stats.ended_by_draw);
         FlushChunkBatches();
     }
