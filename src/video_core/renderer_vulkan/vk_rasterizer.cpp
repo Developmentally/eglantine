@@ -566,6 +566,16 @@ bool RasterizerVulkan::BeginChunkBatch(const ChunkPattern& pattern) {
     if (program == ~size_t{0}) {
         return false; // the patches feed something other than storage buffers: not ours
     }
+    // The draw's row travels in its first instance: no stage may read the instance builtins.
+    for (size_t candidate = 1; candidate < Maxwell::MaxShaderProgram; ++candidate) {
+        if (!regs.IsShaderConfigEnabled(candidate)) {
+            continue;
+        }
+        const auto& loads = base->StageInfos()[candidate - 1].loads;
+        if (loads[Shader::IR::Attribute::InstanceId] || loads[Shader::IR::Attribute::BaseInstance]) {
+            return fail("a stage reads the instance id");
+        }
+    }
     const auto& cbuf = maxwell3d->state.shader_stages[stage].const_buffers[bank];
     if (cbuf.size == 0 || cbuf.size > Maxwell::MaxConstBufferSize) {
         return fail("constant buffer size");
