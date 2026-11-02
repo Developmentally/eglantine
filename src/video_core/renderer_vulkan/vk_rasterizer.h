@@ -204,7 +204,13 @@ private:
         std::vector<u8> cbuf_copy;
         std::vector<u32> rows;    ///< MaxSlots u32 per draw
         std::vector<VkDrawIndexedIndirectCommand> commands;
-        std::vector<u8> indices;  ///< every draw's indices, gathered
+        struct IndexCopy {
+            GPUVAddr source;
+            u32 bytes;
+            u32 arena_offset;
+        };
+        std::vector<IndexCopy> index_copies;  ///< every draw's indices, gathered into the arena
+        u32 arena_used{};
         GraphicsPipeline* pipeline{};
     };
     /// Batches open at once (one per patched constant buffer and slot set in practice); the
