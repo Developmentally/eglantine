@@ -629,7 +629,13 @@ bool RasterizerVulkan::ExtendChunkBatch(ChunkBatch& batch, const ChunkPattern& p
         const u32 n = value ? static_cast<u32>(std::strtoul(value, nullptr, 10)) : ChunkBatch::MaxDraws;
         return std::clamp<u32>(n, 1, ChunkBatch::MaxDraws);
     }();
-    if (batch.commands.size() >= max_draws) {
+    // EDEN_NX2_CHUNK_BATCH_NO_ARENA=1: bind each draw's own index buffer instead of gathering
+    // (one draw per batch), to tell arena problems from the rest.
+    static const bool no_arena = [] {
+        const char* value = std::getenv("EDEN_NX2_CHUNK_BATCH_NO_ARENA");
+        return value != nullptr && value[0] == '1';
+    }();
+    if (batch.commands.size() >= (no_arena ? 1U : max_draws)) {
         return false;
     }
     const auto& regs = maxwell3d->regs;
@@ -733,6 +739,7 @@ void RasterizerVulkan::DrawChunkBatch(ChunkBatch& batch) {
     AccelerateInlineToMemory(batch.scratch + batch.commands_offset, commands_bytes,
                              std::span{reinterpret_cast<const u8*>(batch.commands.data()), commands_bytes});
     const u32 indices_bytes = batch.arena_used;
+    const bool no_arena = std::getenv("EDEN_NX2_CHUNK_BATCH_NO_ARENA") != nullptr;
     gpu_memory->FlushCaching();
     // Configure with the copy in the bank and the index window bound; the state the game set is
     // restored afterwards and the index buffer marked dirty so the next draw re-binds its own.
@@ -751,7 +758,7 @@ void RasterizerVulkan::DrawChunkBatch(ChunkBatch& batch) {
     };
     bound_cbuf = {.address = batch.scratch, .size = copy_size, .enabled = true};
     buffer_cache.BindGraphicsUniformBuffer(batch.stage, batch.bank, batch.scratch, copy_size);
-    const GPUVAddr arena = batch.scratch + batch.indices_offset;
+    const GPUVAddr arena = no_arena ? batch.index_copies.front().source : batch.scratch + batch.indices_offset;
     index_mut.start_addr_high = static_cast<u32>(arena >> 32);
     index_mut.start_addr_low = static_cast<u32>(arena);
     const GPUVAddr index_end = arena + indices_bytes - 1;
@@ -775,7 +782,7 @@ void RasterizerVulkan::DrawChunkBatch(ChunkBatch& batch) {
         VideoCommon::ObtainBufferOperation::DoNothing);
     // The indices are the GPU's (the terrain is meshed there), so they are gathered on the GPU:
     // one copy per source buffer into the arena.
-    {
+    if (!no_arena) {
         // Marked as written so that binding the arena does not upload guest memory over it.
         const auto [arena_buffer, arena_offset] = buffer_cache.ObtainBuffer(
             batch.scratch + batch.indices_offset, indices_bytes,
