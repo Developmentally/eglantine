@@ -896,6 +896,17 @@ void RasterizerVulkan::DrawChunkBatch(ChunkBatch& batch) {
         const auto [index_buffer, index_offset] = buffer_cache.ObtainBuffer(
             draw.index_address, index_bytes, VideoCommon::ObtainBufferSynchronize::FullSynchronize,
             VideoCommon::ObtainBufferOperation::DoNothing);
+        static u32 logged_draws{};
+        if (logged_draws < 24) {
+            ++logged_draws;
+            LOG_INFO(HW_GPU,
+                     "Chunk draw {}/{}: indices {:#x} (+{:#x} in {}) first {} count {} base vertex {}; vb0 {:#x}+{:#x} "
+                     "stride {} vb1 {:#x}+{:#x}; row {}",
+                     index, count, draw.index_address, index_offset, fmt::ptr(index_buffer->Handle()), draw.first_index,
+                     draw.index_count, draw.base_vertex, draw.vb_address[0], draw.vb_size[0],
+                     regs.vertex_streams[0].stride.Value(), draw.vb_address[1], draw.vb_size[1],
+                     batch.rows[index * ChunkBatch::MaxSlots]);
+        }
         buffer_cache.runtime.BindIndexBuffer(topology, index_format, draw.first_index, draw.index_count,
                                              index_buffer->Handle(), index_offset, index_bytes);
         // EDEN_NX2_CHUNK_BATCH_ROW0=1: every draw reads row 0 (experiments: wrong deltas, but
