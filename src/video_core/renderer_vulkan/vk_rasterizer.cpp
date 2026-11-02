@@ -557,30 +557,24 @@ bool RasterizerVulkan::BeginChunkBatch(const ChunkPattern& pattern) {
     const u32 table_slot_offset = Common::AlignUp(cbuf.size, 16U);
     batch.table.table_slot = {bank, table_slot_offset};
     batch.table.stride = ChunkBatch::MaxSlots * sizeof(u32);
-    // Index window.
-    const auto& index_regs = regs.index_buffer;
-    const auto& draw_state = maxwell3d->draw_manager.draw_state;
-    batch.index_format = static_cast<u32>(index_regs.format);
+    // Indices: each chunk's few hundred sit in their own small mapping, so they are gathered
+    // into one arena per batch instead of bound where they are.
+    batch.index_format = static_cast<u32>(regs.index_buffer.format);
     batch.index_shift = batch.index_format == 0 ? 0 : batch.index_format == 1 ? 1 : 2;
-    const GPUVAddr index_address = index_regs.StartAddress();
-    const u64 index_need = u64{draw_state.index_buffer.first + draw_state.index_buffer.count} << batch.index_shift;
-    const auto index_window = ChunkWindow(index_address, index_need);
-    if (!index_window) {
-        return fail("index buffer unmapped");
-    }
-    batch.index_base = index_window->first;
-    batch.index_size = index_window->second;
-    // Scratch: [constant buffer copy with span bases and the table pointer | table | commands].
+    // Scratch: [constant buffer copy with span bases and the table pointer | table | commands |
+    // index arena].
     const u32 copy_size = table_slot_offset + 16;
     batch.table_offset = Common::AlignUp(copy_size, 256U);
     batch.commands_offset = batch.table_offset + ChunkBatch::MaxDraws * batch.table.stride;
-    const u64 total = batch.commands_offset + u64{ChunkBatch::MaxDraws} * sizeof(VkDrawIndexedIndirectCommand);
+    batch.indices_offset = batch.commands_offset + ChunkBatch::MaxDraws * static_cast<u32>(sizeof(VkDrawIndexedIndirectCommand));
+    const u64 total = u64{batch.indices_offset} + ChunkBatch::IndexArenaBytes;
     batch.scratch = ReserveScratch(total);
     if (batch.scratch == 0) {
         return fail("no scratch");
     }
     batch.scratch_size = total;
     batch.cbuf_copy.assign(copy_size, 0);
+    batch.indices.reserve(ChunkBatch::IndexArenaBytes / 4);
     gpu_memory->ReadBlockUnsafe(pattern.cbuf_address, batch.cbuf_copy.data(), cbuf.size);
     const auto put64 = [&](u32 at, u64 value) { std::memcpy(batch.cbuf_copy.data() + at, &value, sizeof(value)); };
     for (u32 k = 0; k < pattern.num_slots; ++k) {
@@ -602,11 +596,10 @@ bool RasterizerVulkan::BeginChunkBatch(const ChunkPattern& pattern) {
     }
     if (logged < 32) {
         ++logged;
-        LOG_INFO(HW_GPU, "Chunk batch started: vs {:#x} program slot {} bank {} cbuf {:#x} slots{} spans{} index window {:#x}+{:#x}",
+        LOG_INFO(HW_GPU, "Chunk batch started: vs {:#x} program slot {} bank {} cbuf {:#x} slots{} spans{} index format {}",
                  vertex_program, program, bank, pattern.cbuf_address,
                  fmt::join(std::span{pattern.slots.data(), pattern.num_slots}, ","),
-                 fmt::join(std::span{batch.span_size.data(), pattern.num_slots}, ","),
-                 batch.index_base, batch.index_size);
+                 fmt::join(std::span{batch.span_size.data(), pattern.num_slots}, ","), batch.index_format);
     }
     chunk_batches.push_back(std::move(batch));
     // Any other register write flushes the batches before it changes the state they ran with.
@@ -636,11 +629,23 @@ bool RasterizerVulkan::ExtendChunkBatch(ChunkBatch& batch, const ChunkPattern& p
     if (static_cast<u32>(regs.index_buffer.format) != batch.index_format) {
         return false;
     }
-    const GPUVAddr index_address = regs.index_buffer.StartAddress();
-    const u64 index_need = u64{draw_state.index_buffer.first + draw_state.index_buffer.count} << batch.index_shift;
-    if (index_address < batch.index_base || index_address + index_need > batch.index_base + batch.index_size) {
+    const u64 index_bytes = u64{draw_state.index_buffer.count} << batch.index_shift;
+    const GPUVAddr index_source =
+        regs.index_buffer.StartAddress() + (u64{draw_state.index_buffer.first} << batch.index_shift);
+    const size_t arena_used = batch.indices.size();
+    if (arena_used + index_bytes > ChunkBatch::IndexArenaBytes ||
+        !gpu_memory->IsFullyMappedRange(index_source, index_bytes)) {
         ++chunk_batch_stats.miss_index;
         return false;
+    }
+    {
+        // The copy is taken from guest memory, so the indices must not be the GPU's to write.
+        const auto device_addr = gpu_memory->GpuToCpuAddress(index_source);
+        std::scoped_lock lock{buffer_cache.mutex};
+        if (!device_addr || buffer_cache.IsRegionGpuModified(*device_addr, index_bytes)) {
+            ++chunk_batch_stats.miss_index;
+            return false;
+        }
     }
     std::array<u32, ChunkBatch::MaxSlots> deltas{};
     for (u32 k = 0; k < pattern.num_slots; ++k) {
@@ -652,11 +657,13 @@ bool RasterizerVulkan::ExtendChunkBatch(ChunkBatch& batch, const ChunkPattern& p
         }
         deltas[k] = static_cast<u32>(pointer - batch.span_base[k]);
     }
+    batch.indices.resize(arena_used + index_bytes);
+    gpu_memory->ReadBlockUnsafe(index_source, batch.indices.data() + arena_used, index_bytes);
     batch.rows.insert(batch.rows.end(), deltas.begin(), deltas.end());
     batch.commands.push_back(VkDrawIndexedIndirectCommand{
         .indexCount = draw_state.index_buffer.count,
         .instanceCount = 1,
-        .firstIndex = static_cast<u32>((index_address - batch.index_base) >> batch.index_shift) + draw_state.index_buffer.first,
+        .firstIndex = static_cast<u32>(arena_used >> batch.index_shift),
         .vertexOffset = static_cast<s32>(draw_state.base_index),
         .firstInstance = draw_state.base_instance,
     });
@@ -711,6 +718,8 @@ void RasterizerVulkan::DrawChunkBatch(ChunkBatch& batch) {
                              std::span{reinterpret_cast<const u8*>(batch.rows.data()), rows_bytes});
     AccelerateInlineToMemory(batch.scratch + batch.commands_offset, commands_bytes,
                              std::span{reinterpret_cast<const u8*>(batch.commands.data()), commands_bytes});
+    const u32 indices_bytes = static_cast<u32>(batch.indices.size());
+    AccelerateInlineToMemory(batch.scratch + batch.indices_offset, indices_bytes, batch.indices);
     gpu_memory->FlushCaching();
     // Configure with the copy in the bank and the index window bound; the state the game set is
     // restored afterwards and the index buffer marked dirty so the next draw re-binds its own.
@@ -729,13 +738,14 @@ void RasterizerVulkan::DrawChunkBatch(ChunkBatch& batch) {
     };
     bound_cbuf = {.address = batch.scratch, .size = copy_size, .enabled = true};
     buffer_cache.BindGraphicsUniformBuffer(batch.stage, batch.bank, batch.scratch, copy_size);
-    index_mut.start_addr_high = static_cast<u32>(batch.index_base >> 32);
-    index_mut.start_addr_low = static_cast<u32>(batch.index_base);
-    const GPUVAddr index_end = batch.index_base + batch.index_size - 1;
+    const GPUVAddr arena = batch.scratch + batch.indices_offset;
+    index_mut.start_addr_high = static_cast<u32>(arena >> 32);
+    index_mut.start_addr_low = static_cast<u32>(arena);
+    const GPUVAddr index_end = arena + indices_bytes - 1;
     index_mut.limit_addr_high = static_cast<u32>(index_end >> 32);
     index_mut.limit_addr_low = static_cast<u32>(index_end);
     draw_state_mut.index_buffer.first = 0;
-    draw_state_mut.index_buffer.count = static_cast<u32>(batch.index_size >> batch.index_shift);
+    draw_state_mut.index_buffer.count = indices_bytes >> batch.index_shift;
     maxwell3d->dirty.flags[VideoCommon::Dirty::IndexBuffer] = true;
     std::scoped_lock lock{buffer_cache.mutex, texture_cache.mutex};
     // One cached buffer over the whole slot, so the table and command regions live in the buffer
@@ -743,7 +753,7 @@ void RasterizerVulkan::DrawChunkBatch(ChunkBatch& batch) {
     [[maybe_unused]] const auto whole_slot = buffer_cache.ObtainBuffer(
         batch.scratch, static_cast<u32>(batch.scratch_size), VideoCommon::ObtainBufferSynchronize::NoSynchronize,
         VideoCommon::ObtainBufferOperation::DoNothing);
-    const u32 upload_size = batch.commands_offset + commands_bytes - batch.table_offset;
+    const u32 upload_size = batch.indices_offset + indices_bytes - batch.table_offset;
     [[maybe_unused]] const auto uploaded = buffer_cache.ObtainBuffer(
         batch.scratch + batch.table_offset, upload_size,
         VideoCommon::ObtainBufferSynchronize::FullSynchronize,

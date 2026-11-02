@@ -185,6 +185,7 @@ private:
     struct ChunkBatch {
         static constexpr u32 MaxDraws = 4096;
         static constexpr u32 MaxSlots = 4;
+        static constexpr u32 IndexArenaBytes = 4 << 20;
         GPUVAddr cbuf_address{};  ///< the patched constant buffer (CB_ADDRESS of the pattern)
         u32 cbuf_size{};
         size_t program{};         ///< program slot whose bank it is
@@ -193,22 +194,22 @@ private:
         Shader::Environment::DrawTable table{};
         std::array<GPUVAddr, MaxSlots> span_base{};
         std::array<u64, MaxSlots> span_size{};
-        GPUVAddr index_base{};
-        u64 index_size{};
         u32 index_shift{};
         u32 index_format{};
-        GPUVAddr scratch{};       ///< [cbuf copy | table | indirect commands]
+        GPUVAddr scratch{};       ///< [cbuf copy | table | indirect commands | index arena]
         u64 scratch_size{};
         u32 table_offset{};
         u32 commands_offset{};
+        u32 indices_offset{};
         std::vector<u8> cbuf_copy;
         std::vector<u32> rows;    ///< MaxSlots u32 per draw
         std::vector<VkDrawIndexedIndirectCommand> commands;
+        std::vector<u8> indices;  ///< every draw's indices, gathered
         GraphicsPipeline* pipeline{};
     };
-    /// Batches open at once: consecutive chunk draws rotate through several index buffers, each
-    /// in its own mapping, and the geometry shader only appends to each chunk's own record, so
-    /// the draws of different batches may be reordered.
+    /// Batches open at once (one per patched constant buffer and slot set in practice); the
+    /// geometry shader only appends to each chunk's own record, so the draws of different
+    /// batches may be reordered.
     static constexpr size_t MaxOpenChunkBatches = 8;
     std::vector<ChunkBatch> chunk_batches;
     /// Windows found for pointers, per 64 KiB of pointer; cleared when mappings change.
