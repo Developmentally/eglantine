@@ -185,7 +185,6 @@ private:
     struct ChunkBatch {
         static constexpr u32 MaxDraws = 4096;
         static constexpr u32 MaxSlots = 4;
-        static constexpr u32 IndexArenaBytes = 4 << 20;
         GPUVAddr cbuf_address{};  ///< the patched constant buffer (CB_ADDRESS of the pattern)
         u32 cbuf_size{};
         size_t program{};         ///< program slot whose bank it is
@@ -196,27 +195,30 @@ private:
         std::array<u64, MaxSlots> span_size{};
         u32 index_shift{};
         u32 index_format{};
-        GPUVAddr scratch{};       ///< [cbuf copy | table | indirect commands | index arena]
+        u32 topology{};
+        u32 stream_mask{};        ///< enabled vertex streams, bound per draw
+        GPUVAddr scratch{};       ///< [cbuf copy | table]
         u64 scratch_size{};
         u32 table_offset{};
-        u32 commands_offset{};
-        u32 indices_offset{};
         std::vector<u8> cbuf_copy;
         std::vector<u32> rows;    ///< MaxSlots u32 per draw
-        std::vector<VkDrawIndexedIndirectCommand> commands;
-        struct IndexCopy {
-            GPUVAddr source;
-            u32 bytes;
-            u32 arena_offset;
+        /// One chunk: its own index range and vertex buffers; the pipeline, descriptors and the
+        /// rest of the state are the batch's.
+        struct Draw {
+            GPUVAddr index_address;
+            u32 first_index;
+            u32 index_count;
+            s32 base_vertex;
+            std::array<GPUVAddr, Tegra::Engines::Maxwell3D::Regs::NumVertexArrays> vb_address{};
+            std::array<u32, Tegra::Engines::Maxwell3D::Regs::NumVertexArrays> vb_size{};
         };
-        std::vector<IndexCopy> index_copies;  ///< every draw's indices, gathered into the arena
-        u32 arena_used{};
+        std::vector<Draw> draws;
+        GraphicsPipeline* pipeline{};
         // EDEN_NX2_CHUNK_BATCH_VERIFY: the state at Begin, compared at the flush.
         std::unique_ptr<std::array<u32, Tegra::Engines::Maxwell3D::Regs::NUM_REGS>> regs_snapshot;
         std::array<u32, 6> draw_snapshot{};
         std::array<u64, Tegra::Engines::Maxwell3D::Regs::MaxShaderStage * Tegra::Engines::Maxwell3D::Regs::MaxConstBuffers> cbuf_snapshot{};
         Tegra::Engines::Maxwell3D::DirtyState::Flags dirty_snapshot;
-        GraphicsPipeline* pipeline{};
     };
     /// Batches open at once (one per patched constant buffer and slot set in practice); the
     /// geometry shader only appends to each chunk's own record, so the draws of different
@@ -232,7 +234,7 @@ private:
         u64 draws{};
         u64 ended_by_miss{};  ///< a chunk draw outside every open batch, with none free
         u64 ended_by_draw{};  ///< a draw that is not a chunk draw
-        u64 miss_index{};
+        u64 miss_index{};     ///< a vertex buffer of unusable size
         std::array<u64, ChunkBatch::MaxSlots> miss_slot{};
     } chunk_batch_stats;
     /// The pattern of register writes since the previous draw, if it is a chunk patch.

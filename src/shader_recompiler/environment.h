@@ -135,7 +135,7 @@ public:
     /// Batched draws: storage buffers whose pointer lives at one of `slots` are addressed per
     /// draw. The host binds a span covering every draw's buffer at the slot and a table of
     /// `u32 delta[slots]` rows, `stride` bytes apart, at the pointer in `table_slot`; the
-    /// program adds `row[gl_DrawID].delta[i]` to each access through slot i.
+    /// program adds `row[gl_BaseInstance].delta[i]` (the draw's first instance is its row) to each access through slot i.
     struct DrawTable {
         struct Slot {
             u32 cbuf_index;
@@ -145,11 +145,11 @@ public:
         u32 num_slots{};
         Slot table_slot{};
         u32 stride{};
-        /// Generic attribute (0-31) through which the vertex program forwards gl_DrawID to a
+        /// Generic attribute (0-31) through which the vertex program forwards gl_BaseInstance to a
         /// later stage that is patched (hosts give geometry programs no draw index of their
-        /// own); ~0 when the patched stage reads gl_DrawID itself.
+        /// own); ~0 when the patched stage reads gl_BaseInstance itself.
         u32 draw_id_attribute{~0U};
-        /// Set on the vertex program's environment: forward gl_DrawID on `draw_id_attribute`.
+        /// Set on the vertex program's environment: forward gl_BaseInstance on `draw_id_attribute`.
         bool forward_draw_id{};
 
         [[nodiscard]] bool Enabled() const noexcept {

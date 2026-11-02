@@ -319,6 +319,12 @@ void Maxwell3D::ConsumeSinkImpl(Core::System& system) {
     const bool skip_same = SkipSameValueWrites();
     const auto process = [&](u32 method, u32 value) {
         if (!skip_same || regs.reg_array[method] != value) {
+            // Same observers as CallMethod: the writes-since-draw recorder and the batched-draw
+            // guard, which flushes before a register they did not run with changes.
+            if (record_writes_since_draw && writes_since_draw.size() < 256) [[unlikely]] {
+                writes_since_draw.emplace_back(method, value);
+            }
+            GuardBatchedDraws(method);
             ProcessDirtyRegisters(method, value);
         }
     };

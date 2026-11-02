@@ -366,6 +366,18 @@ constexpr u32 IndexFirst = RegIndex(offsetof(Maxwell, index_buffer.first));
 constexpr u32 IndexCount = RegIndex(offsetof(Maxwell, index_buffer.count));
 constexpr u32 DrawBegin = RegIndex(offsetof(Maxwell, draw.begin));
 constexpr u32 DrawEnd = RegIndex(offsetof(Maxwell, draw.end));
+// Per-chunk vertex buffers: stream addresses, legacy limits and the native byte sizes (0x600).
+constexpr u32 StreamsBegin = RegIndex(offsetof(Maxwell, vertex_streams));
+constexpr u32 StreamsEnd = StreamsBegin + Maxwell::NumVertexArrays * 4;
+constexpr u32 LimitsBegin = RegIndex(offsetof(Maxwell, vertex_stream_limits));
+constexpr u32 LimitsEnd = LimitsBegin + Maxwell::NumVertexArrays * 2;
+constexpr u32 SizesBegin = 0x600 / sizeof(u32);
+constexpr u32 SizesEnd = SizesBegin + Maxwell::NumVertexArrays * 2;
+
+constexpr bool IsVertexStreamMethod(u32 method) {
+    return (method >= StreamsBegin && method < StreamsEnd) || (method >= LimitsBegin && method < LimitsEnd) ||
+           (method >= SizesBegin && method < SizesEnd);
+}
 
 std::bitset<Maxwell::NUM_REGS> Set() {
     std::bitset<Maxwell::NUM_REGS> set;
@@ -374,6 +386,11 @@ std::bitset<Maxwell::NUM_REGS> Set() {
     }
     for (u32 word = 0; word < CbDataWords; ++word) {
         set.set(CbData + word);
+    }
+    for (u32 method = 0; method < Maxwell::NUM_REGS; ++method) {
+        if (IsVertexStreamMethod(method)) {
+            set.set(method);
+        }
     }
     return set;
 }
@@ -416,6 +433,9 @@ std::optional<RasterizerVulkan::ChunkPattern> RasterizerVulkan::MatchChunkPatter
                            method == IndexCount || method == DrawBegin || method == DrawEnd)) {
             continue;
         }
+        if (IsVertexStreamMethod(method) && IsVertexStreamMethod(method + count - 1)) {
+            continue; // this chunk's vertex buffer
+        }
         return std::nullopt;
     }
     if (ranges.empty() || ranges.size() > ChunkBatch::MaxSlots) {
@@ -438,7 +458,8 @@ bool RasterizerVulkan::TryBatchChunkDraw(bool is_indexed, u32 instance_count) {
     }
     maxwell3d->record_writes_since_draw = true;
     const auto& draw_state = maxwell3d->draw_manager.draw_state;
-    const bool simple = is_indexed && instance_count <= 1 &&
+    // The first instance carries the draw's row in the table, so it must be free.
+    const bool simple = is_indexed && instance_count <= 1 && draw_state.base_instance == 0 &&
                         draw_state.inline_index_draw_indexes.empty() &&
                         draw_state.draw_mode == Tegra::Engines::Maxwell3D::DrawManager::DrawMode::General;
     const auto pattern = simple ? MatchChunkPattern() : std::nullopt;
@@ -571,19 +592,18 @@ bool RasterizerVulkan::BeginChunkBatch(const ChunkPattern& pattern) {
     const u32 table_slot_offset = Common::AlignUp(cbuf.size, 16U);
     batch.table.table_slot = {bank, table_slot_offset};
     batch.table.stride = ChunkBatch::MaxSlots * sizeof(u32);
-    // Indices: each chunk's few hundred sit in their own small mapping, so they are gathered
-    // into one arena per batch instead of bound where they are.
     batch.index_format = static_cast<u32>(regs.index_buffer.format);
     batch.index_shift = batch.index_format == 0 ? 0 : batch.index_format == 1 ? 1 : 2;
-    // Scratch: [constant buffer copy with span bases and the table pointer | table | commands |
-    // index arena].
+    batch.topology = static_cast<u32>(maxwell3d->draw_manager.draw_state.topology);
+    for (u32 i = 0; i < Maxwell::NumVertexArrays; ++i) {
+        if (regs.vertex_streams[i].IsEnabled()) {
+            batch.stream_mask |= 1U << i;
+        }
+    }
+    // Scratch: [constant buffer copy with span bases and the table pointer | table].
     const u32 copy_size = table_slot_offset + 16;
     batch.table_offset = Common::AlignUp(copy_size, 256U);
-    batch.commands_offset = batch.table_offset + ChunkBatch::MaxDraws * batch.table.stride;
-    // Page aligned: the arena is GPU-written, the regions before it CPU-written.
-    batch.indices_offset = Common::AlignUp(
-        batch.commands_offset + ChunkBatch::MaxDraws * static_cast<u32>(sizeof(VkDrawIndexedIndirectCommand)), 0x1000U);
-    const u64 total = u64{batch.indices_offset} + ChunkBatch::IndexArenaBytes;
+    const u64 total = u64{batch.table_offset} + ChunkBatch::MaxDraws * batch.table.stride;
     batch.scratch = ReserveScratch(total);
     if (batch.scratch == 0) {
         return fail("no scratch");
@@ -611,10 +631,11 @@ bool RasterizerVulkan::BeginChunkBatch(const ChunkPattern& pattern) {
     }
     if (logged < 32) {
         ++logged;
-        LOG_INFO(HW_GPU, "Chunk batch started: vs {:#x} program slot {} bank {} cbuf {:#x} slots{} spans{} index format {}",
+        LOG_INFO(HW_GPU, "Chunk batch started: vs {:#x} program slot {} bank {} cbuf {:#x} slots{} spans{} index format {} streams {:#x}",
                  vertex_program, program, bank, pattern.cbuf_address,
                  fmt::join(std::span{pattern.slots.data(), pattern.num_slots}, ","),
-                 fmt::join(std::span{batch.span_size.data(), pattern.num_slots}, ","), batch.index_format);
+                 fmt::join(std::span{batch.span_size.data(), pattern.num_slots}, ","), batch.index_format,
+                 batch.stream_mask);
     }
     // EDEN_NX2_CHUNK_BATCH_VERIFY=1: remember the state the batch opened with, to compare at the
     // flush (diagnostic).
@@ -660,27 +681,42 @@ bool RasterizerVulkan::ExtendChunkBatch(ChunkBatch& batch, const ChunkPattern& p
         const u32 n = value ? static_cast<u32>(std::strtoul(value, nullptr, 10)) : ChunkBatch::MaxDraws;
         return std::clamp<u32>(n, 1, ChunkBatch::MaxDraws);
     }();
-    // EDEN_NX2_CHUNK_BATCH_NO_ARENA=1: bind each draw's own index buffer instead of gathering
-    // (one draw per batch), to tell arena problems from the rest.
-    static const bool no_arena = [] {
-        const char* value = std::getenv("EDEN_NX2_CHUNK_BATCH_NO_ARENA");
-        return value != nullptr && value[0] == '1';
-    }();
-    if (batch.commands.size() >= (no_arena ? 1U : max_draws)) {
+    if (batch.draws.size() >= max_draws) {
         return false;
     }
     const auto& regs = maxwell3d->regs;
     const auto& draw_state = maxwell3d->draw_manager.draw_state;
-    if (static_cast<u32>(regs.index_buffer.format) != batch.index_format) {
+    if (static_cast<u32>(regs.index_buffer.format) != batch.index_format ||
+        static_cast<u32>(draw_state.topology) != batch.topology) {
         return false;
     }
-    const u32 index_bytes = draw_state.index_buffer.count << batch.index_shift;
-    const GPUVAddr index_source =
-        regs.index_buffer.StartAddress() + (u64{draw_state.index_buffer.first} << batch.index_shift);
-    const u32 arena_used = batch.arena_used;
-    if (index_bytes == 0 || arena_used + index_bytes > ChunkBatch::IndexArenaBytes ||
-        !gpu_memory->IsFullyMappedRange(index_source, index_bytes)) {
-        ++chunk_batch_stats.miss_index;
+    ChunkBatch::Draw draw{
+        .index_address = regs.index_buffer.StartAddress(),
+        .first_index = draw_state.index_buffer.first,
+        .index_count = draw_state.index_buffer.count,
+        .base_vertex = static_cast<s32>(draw_state.base_index),
+    };
+    if (draw.index_count == 0) {
+        return false;
+    }
+    u32 streams = 0;
+    const bool native = maxwell3d->GetNativeMacroEngine().native_turing;
+    for (u32 i = 0; i < Maxwell::NumVertexArrays; ++i) {
+        const auto& stream = regs.vertex_streams[i];
+        if (!stream.IsEnabled()) {
+            continue;
+        }
+        streams |= 1U << i;
+        const GPUVAddr begin = stream.Address();
+        const u64 end = native ? begin + regs.NativeVertexStreamSize(i) : regs.vertex_stream_limits[i].Address() + 1;
+        if (end <= begin || end - begin > (std::numeric_limits<u32>::max)()) {
+            ++chunk_batch_stats.miss_index;
+            return false;
+        }
+        draw.vb_address[i] = begin;
+        draw.vb_size[i] = static_cast<u32>(end - begin);
+    }
+    if (streams != batch.stream_mask) {
         return false;
     }
     std::array<u32, ChunkBatch::MaxSlots> deltas{};
@@ -693,16 +729,8 @@ bool RasterizerVulkan::ExtendChunkBatch(ChunkBatch& batch, const ChunkPattern& p
         }
         deltas[k] = static_cast<u32>(pointer - batch.span_base[k]);
     }
-    batch.index_copies.push_back({.source = index_source, .bytes = index_bytes, .arena_offset = arena_used});
-    batch.arena_used = Common::AlignUp(arena_used + index_bytes, 4U);
     batch.rows.insert(batch.rows.end(), deltas.begin(), deltas.end());
-    batch.commands.push_back(VkDrawIndexedIndirectCommand{
-        .indexCount = draw_state.index_buffer.count,
-        .instanceCount = 1,
-        .firstIndex = static_cast<u32>(arena_used >> batch.index_shift),
-        .vertexOffset = static_cast<s32>(draw_state.base_index),
-        .firstInstance = draw_state.base_instance,
-    });
+    batch.draws.push_back(draw);
     return true;
 }
 
@@ -722,7 +750,7 @@ void RasterizerVulkan::FlushChunkBatches() {
     auto& stats = chunk_batch_stats;
     stats.batches += batches.size();
     for (const ChunkBatch& batch : batches) {
-        stats.draws += batch.commands.size();
+        stats.draws += batch.draws.size();
     }
     ++stats.flushes;
     if (const auto now = std::chrono::steady_clock::now(); now - stats.window > std::chrono::seconds{10}) {
@@ -740,7 +768,7 @@ void RasterizerVulkan::FlushChunkBatches() {
 }
 
 void RasterizerVulkan::DrawChunkBatch(ChunkBatch& batch) {
-    const u32 count = static_cast<u32>(batch.commands.size());
+    const u32 count = static_cast<u32>(batch.draws.size());
     if (count == 0) {
         return;
     }
@@ -768,8 +796,9 @@ void RasterizerVulkan::DrawChunkBatch(ChunkBatch& batch) {
                     }
                 }
             }
-            const std::array<u32, 6> now{static_cast<u32>(draw_state.topology), draw_state.base_index, draw_state.base_instance,
-                                         draw_state.instance_count, static_cast<u32>(draw_state.draw_mode),
+            const std::array<u32, 6> now{static_cast<u32>(draw_state.topology), draw_state.base_index,
+                                         draw_state.base_instance, draw_state.instance_count,
+                                         static_cast<u32>(draw_state.draw_mode),
                                          static_cast<u32>(draw_state.inline_index_draw_indexes.size())};
             u32 dirty_new = 0;
             for (size_t f = 0; f < batch.dirty_snapshot.size(); ++f) {
@@ -785,101 +814,47 @@ void RasterizerVulkan::DrawChunkBatch(ChunkBatch& batch) {
     static u32 dumped{};
     if (dumped < 4) {
         ++dumped;
-        const auto& c = batch.commands.front();
+        const auto& d = batch.draws.front();
         LOG_INFO(HW_GPU,
-                 "Chunk batch of {} draws: scratch {:#x} table +{:#x} commands +{:#x} indices +{:#x} ({} bytes "
-                 "gathered); "
-                 "spans {:#x}+{:#x}, {:#x}+{:#x}; row 0 deltas {:#x},{:#x}; command 0 indexCount {} "
-                 "firstIndex {} vertexOffset {} firstInstance {}; last row deltas {:#x},{:#x}",
-                 count, batch.scratch, batch.table_offset, batch.commands_offset, batch.indices_offset,
-                 batch.arena_used, batch.span_base[0], batch.span_size[0], batch.span_base[1],
-                 batch.span_size[1], batch.rows[0], batch.rows[1], c.indexCount, c.firstIndex,
-                 c.vertexOffset, c.firstInstance, batch.rows[(count - 1) * ChunkBatch::MaxSlots],
+                 "Chunk batch of {} draws: scratch {:#x} table +{:#x}; spans {:#x}+{:#x}, {:#x}+{:#x}; row 0 deltas "
+                 "{:#x},{:#x}; draw 0 indices {:#x} first {} count {} base vertex {} vb0 {:#x}+{:#x}; last row deltas "
+                 "{:#x},{:#x}",
+                 count, batch.scratch, batch.table_offset, batch.span_base[0], batch.span_size[0], batch.span_base[1],
+                 batch.span_size[1], batch.rows[0], batch.rows[1], d.index_address, d.first_index, d.index_count,
+                 d.base_vertex, d.vb_address[0], d.vb_size[0], batch.rows[(count - 1) * ChunkBatch::MaxSlots],
                  batch.rows[(count - 1) * ChunkBatch::MaxSlots + 1]);
     }
-    // The copy, the table and the commands go through guest memory like any CPU-written buffer,
-    // then the range is obtained with synchronization so the upload is recorded before the draw.
+    // The copy and the table go through guest memory like any CPU-written buffer, then the range
+    // is obtained with synchronization so the upload is recorded before the draws.
     const u32 copy_size = static_cast<u32>(batch.cbuf_copy.size());
     const u32 rows_bytes = count * batch.table.stride;
-    const u32 commands_bytes = count * static_cast<u32>(sizeof(VkDrawIndexedIndirectCommand));
     AccelerateInlineToMemory(batch.scratch, copy_size, batch.cbuf_copy);
     AccelerateInlineToMemory(batch.scratch + batch.table_offset, rows_bytes,
                              std::span{reinterpret_cast<const u8*>(batch.rows.data()), rows_bytes});
-    AccelerateInlineToMemory(batch.scratch + batch.commands_offset, commands_bytes,
-                             std::span{reinterpret_cast<const u8*>(batch.commands.data()), commands_bytes});
-    const u32 indices_bytes = batch.arena_used;
-    const bool no_arena = std::getenv("EDEN_NX2_CHUNK_BATCH_NO_ARENA") != nullptr;
     gpu_memory->FlushCaching();
-    // Configure with the copy in the bank and the index window bound; the state the game set is
-    // restored afterwards and the index buffer marked dirty so the next draw re-binds its own.
+    // Configure once with the copy in the bank; the bank the game set is restored afterwards. The
+    // vertex and index buffers are bound per draw below and marked dirty so the next draw re-binds
+    // its own.
     auto& bound_cbuf = maxwell3d->state.shader_stages[batch.stage].const_buffers[batch.bank];
     const auto saved_cbuf = bound_cbuf;
-    auto& index_mut = maxwell3d->regs.index_buffer;
-    const auto saved_index = index_mut;
-    auto& draw_state_mut = maxwell3d->draw_manager.draw_state;
-    const auto saved_index_state = draw_state_mut.index_buffer;
     SCOPE_EXIT {
         bound_cbuf = saved_cbuf;
         buffer_cache.BindGraphicsUniformBuffer(batch.stage, batch.bank, saved_cbuf.address, saved_cbuf.size);
-        index_mut = saved_index;
-        draw_state_mut.index_buffer = saved_index_state;
-        maxwell3d->dirty.flags[VideoCommon::Dirty::IndexBuffer] = true;
+        auto& flags = maxwell3d->dirty.flags;
+        flags[VideoCommon::Dirty::IndexBuffer] = true;
+        flags[VideoCommon::Dirty::VertexBuffers] = true;
+        for (u32 i = 0; i < Maxwell::NumVertexArrays; ++i) {
+            if ((batch.stream_mask >> i) & 1) {
+                flags[VideoCommon::Dirty::VertexBuffer0 + i] = true;
+            }
+        }
     };
     bound_cbuf = {.address = batch.scratch, .size = copy_size, .enabled = true};
     buffer_cache.BindGraphicsUniformBuffer(batch.stage, batch.bank, batch.scratch, copy_size);
-    const GPUVAddr arena = no_arena ? batch.index_copies.front().source : batch.scratch + batch.indices_offset;
-    index_mut.start_addr_high = static_cast<u32>(arena >> 32);
-    index_mut.start_addr_low = static_cast<u32>(arena);
-    const GPUVAddr index_end = arena + indices_bytes - 1;
-    index_mut.limit_addr_high = static_cast<u32>(index_end >> 32);
-    index_mut.limit_addr_low = static_cast<u32>(index_end);
-    // The buffer cache binds from the draw state's copy of the registers, addresses included.
-    draw_state_mut.index_buffer = index_mut;
-    draw_state_mut.index_buffer.first = 0;
-    draw_state_mut.index_buffer.count = indices_bytes >> batch.index_shift;
-    maxwell3d->dirty.flags[VideoCommon::Dirty::IndexBuffer] = true;
     std::scoped_lock lock{buffer_cache.mutex, texture_cache.mutex};
-    // One cached buffer over the whole slot, so the table and command regions live in the buffer
-    // the descriptors point at.
-    [[maybe_unused]] const auto whole_slot = buffer_cache.ObtainBuffer(
-        batch.scratch, static_cast<u32>(batch.scratch_size), VideoCommon::ObtainBufferSynchronize::NoSynchronize,
-        VideoCommon::ObtainBufferOperation::DoNothing);
-    const u32 upload_size = batch.commands_offset + commands_bytes - batch.table_offset;
     [[maybe_unused]] const auto uploaded = buffer_cache.ObtainBuffer(
-        batch.scratch + batch.table_offset, upload_size,
-        VideoCommon::ObtainBufferSynchronize::FullSynchronize,
+        batch.scratch, static_cast<u32>(batch.scratch_size), VideoCommon::ObtainBufferSynchronize::FullSynchronize,
         VideoCommon::ObtainBufferOperation::DoNothing);
-    // The indices are the GPU's (the terrain is meshed there), so they are gathered on the GPU:
-    // one copy per source buffer into the arena.
-    if (!no_arena) {
-        // Marked as written so that binding the arena does not upload guest memory over it.
-        const auto [arena_buffer, arena_offset] = buffer_cache.ObtainBuffer(
-            batch.scratch + batch.indices_offset, indices_bytes,
-            VideoCommon::ObtainBufferSynchronize::NoSynchronize, VideoCommon::ObtainBufferOperation::MarkAsWritten);
-        // Handles only from here: obtaining the sources may reshape the cache's buffer slots.
-        const VkBuffer arena_handle = arena_buffer->Handle();
-        std::ranges::sort(batch.index_copies, {}, &ChunkBatch::IndexCopy::source);
-        boost::container::small_vector<VideoCommon::BufferCopy, 64> copies;
-        VkBuffer source_handle{};
-        const auto flush_copies = [&] {
-            if (!copies.empty()) {
-                buffer_cache.runtime.CopyBuffer(arena_handle, source_handle, copies, true);
-                copies.clear();
-            }
-        };
-        for (const auto& copy : batch.index_copies) {
-            const auto [source, source_offset] = buffer_cache.ObtainBuffer(
-                copy.source, copy.bytes, VideoCommon::ObtainBufferSynchronize::FullSynchronize,
-                VideoCommon::ObtainBufferOperation::DoNothing);
-            if (source->Handle() != source_handle) {
-                flush_copies();
-                source_handle = source->Handle();
-            }
-            copies.push_back({.src_offset = source_offset, .dst_offset = u64{arena_offset} + copy.arena_offset,
-                              .size = copy.bytes});
-        }
-        flush_copies();
-    }
     batch.pipeline->SetEngine(maxwell3d, gpu_memory);
     if (!batch.pipeline->Configure(true)) {
         LOG_WARNING(HW_GPU, "Chunk batch of {} draws dropped: configure failed", count);
@@ -887,17 +862,32 @@ void RasterizerVulkan::DrawChunkBatch(ChunkBatch& batch) {
     }
     UpdateDynamicStates();
     query_cache.NotifySegment(true);
-    const auto [buffer, offset] = buffer_cache.ObtainBuffer(
-        batch.scratch + batch.commands_offset, commands_bytes,
-        VideoCommon::ObtainBufferSynchronize::NoSynchronize,
-        VideoCommon::ObtainBufferOperation::DoNothing);
-    // Read by the indirect draw, which no bind records: without this, the next upload into the
-    // same ring slot is free to move to the upload command buffer, ahead of this draw.
-    buffer->MarkUsage(offset, commands_bytes);
     scheduler.RequestRenderpass(texture_cache.GetFramebuffer());
-    scheduler.Record([handle = buffer->Handle(), offset, count](vk::CommandBuffer cmdbuf) {
-        cmdbuf.DrawIndexedIndirect(handle, offset, count, sizeof(VkDrawIndexedIndirectCommand));
-    });
+    const auto& regs = maxwell3d->regs;
+    const auto topology = maxwell3d->draw_manager.draw_state.topology;
+    const auto index_format = regs.index_buffer.format;
+    for (u32 index = 0; index < count; ++index) {
+        const ChunkBatch::Draw& draw = batch.draws[index];
+        for (u32 i = 0; i < Maxwell::NumVertexArrays; ++i) {
+            if (((batch.stream_mask >> i) & 1) == 0) {
+                continue;
+            }
+            const auto [buffer, offset] = buffer_cache.ObtainBuffer(
+                draw.vb_address[i], draw.vb_size[i], VideoCommon::ObtainBufferSynchronize::FullSynchronize,
+                VideoCommon::ObtainBufferOperation::DoNothing);
+            buffer_cache.runtime.BindVertexBuffer(i, buffer->Handle(), offset, draw.vb_size[i],
+                                                  regs.vertex_streams[i].stride);
+        }
+        const u32 index_bytes = (draw.first_index + draw.index_count) << batch.index_shift;
+        const auto [index_buffer, index_offset] = buffer_cache.ObtainBuffer(
+            draw.index_address, index_bytes, VideoCommon::ObtainBufferSynchronize::FullSynchronize,
+            VideoCommon::ObtainBufferOperation::DoNothing);
+        buffer_cache.runtime.BindIndexBuffer(topology, index_format, draw.first_index, draw.index_count,
+                                             index_buffer->Handle(), index_offset, index_bytes);
+        scheduler.Record([draw, index](vk::CommandBuffer cmdbuf) {
+            cmdbuf.DrawIndexed(draw.index_count, 1, draw.first_index, static_cast<u32>(draw.base_vertex), index);
+        });
+    }
 }
 
 GPUVAddr RasterizerVulkan::ReserveScratch(u64 bytes) {

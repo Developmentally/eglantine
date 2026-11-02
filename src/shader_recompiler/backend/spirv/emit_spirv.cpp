@@ -463,7 +463,8 @@ void SetupCapabilities(const Profile& profile, const Info& info, EmitContext& ct
     }
     if ((!profile.support_vertex_instance_id &&
          (info.loads[IR::Attribute::InstanceId] || info.loads[IR::Attribute::VertexId])) ||
-        info.loads[IR::Attribute::DrawID]) {
+        info.loads[IR::Attribute::DrawID] || info.loads[IR::Attribute::BaseInstance] ||
+        info.loads[IR::Attribute::BaseVertex]) {
         ctx.AddExtension("SPV_KHR_shader_draw_parameters");
         ctx.AddCapability(spv::Capability::DrawParameters);
     }
