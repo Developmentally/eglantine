@@ -566,7 +566,9 @@ bool RasterizerVulkan::BeginChunkBatch(const ChunkPattern& pattern) {
     const u32 copy_size = table_slot_offset + 16;
     batch.table_offset = Common::AlignUp(copy_size, 256U);
     batch.commands_offset = batch.table_offset + ChunkBatch::MaxDraws * batch.table.stride;
-    batch.indices_offset = batch.commands_offset + ChunkBatch::MaxDraws * static_cast<u32>(sizeof(VkDrawIndexedIndirectCommand));
+    // Page aligned: the arena is GPU-written, the regions before it CPU-written.
+    batch.indices_offset = Common::AlignUp(
+        batch.commands_offset + ChunkBatch::MaxDraws * static_cast<u32>(sizeof(VkDrawIndexedIndirectCommand)), 0x1000U);
     const u64 total = u64{batch.indices_offset} + ChunkBatch::IndexArenaBytes;
     batch.scratch = ReserveScratch(total);
     if (batch.scratch == 0) {
@@ -772,9 +774,10 @@ void RasterizerVulkan::DrawChunkBatch(ChunkBatch& batch) {
     // The indices are the GPU's (the terrain is meshed there), so they are gathered on the GPU:
     // one copy per source buffer into the arena.
     {
+        // Marked as written so that binding the arena does not upload guest memory over it.
         const auto [arena_buffer, arena_offset] = buffer_cache.ObtainBuffer(
             batch.scratch + batch.indices_offset, indices_bytes,
-            VideoCommon::ObtainBufferSynchronize::NoSynchronize, VideoCommon::ObtainBufferOperation::DoNothing);
+            VideoCommon::ObtainBufferSynchronize::NoSynchronize, VideoCommon::ObtainBufferOperation::MarkAsWritten);
         // Handles only from here: obtaining the sources may reshape the cache's buffer slots.
         const VkBuffer arena_handle = arena_buffer->Handle();
         std::ranges::sort(batch.index_copies, {}, &ChunkBatch::IndexCopy::source);
