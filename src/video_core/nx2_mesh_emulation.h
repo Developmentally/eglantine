@@ -164,14 +164,14 @@ struct ScratchPlan {
 using LaunchParams = Tegra::Engines::KeplerCompute::LaunchParams;
 using ConstBuffers = std::array<Tegra::Engines::ConstBufferInfo, Maxwell3D::Regs::MaxConstBuffers>;
 
-inline LaunchParams Launch(u32 program_start, u32 workgroups, const ConstBuffers& bound,
+inline LaunchParams Launch(u32 program_start, u32 workgroups, u32 threads, const ConstBuffers& bound,
                            GPUVAddr params_address, const Layout& layout) {
     LaunchParams qmd{};
     qmd.program_start = program_start;
     qmd.grid_dim_x.Assign(workgroups);
     qmd.grid_dim_y.Assign(1);
     qmd.grid_dim_z.Assign(1);
-    qmd.block_dim_x.Assign(32);
+    qmd.block_dim_x.Assign(std::clamp<u32>(threads, 1, 32));
     qmd.block_dim_y.Assign(1);
     qmd.block_dim_z.Assign(1);
     u32 enable_mask = 0;
@@ -199,12 +199,12 @@ inline LaunchParams Launch(u32 program_start, u32 workgroups, const ConstBuffers
 
 inline LaunchParams TaskLaunch(u32 program_start, const DrawDescription& draw, const ConstBuffers& bound,
                                GPUVAddr params_address, const Layout& layout) {
-    return Launch(program_start, draw.TaskWorkgroups(), bound, params_address, layout);
+    return Launch(program_start, draw.TaskWorkgroups(), draw.mesh.task_threads, bound, params_address, layout);
 }
 
 inline LaunchParams MeshLaunch(u32 program_start, const DrawDescription& draw, const ConstBuffers& bound,
                                GPUVAddr params_address, const Layout& layout) {
-    return Launch(program_start, draw.MeshWorkgroups(), bound, params_address, layout);
+    return Launch(program_start, draw.MeshWorkgroups(), draw.mesh.mesh_threads, bound, params_address, layout);
 }
 
 } // namespace VideoCommon::Nx2MeshEmulation

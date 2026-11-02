@@ -759,11 +759,14 @@ u32 ComputeEnvironment::ReadViewportTransformState() {
 
 MeshEmulationEnvironment::MeshEmulationEnvironment(Tegra::Engines::KeplerCompute& kepler_compute_,
                                                    Tegra::MemoryManager& gpu_memory_,
-                                                   GPUVAddr program_base_, bool has_task)
+                                                   GPUVAddr program_base_, bool has_task,
+                                                   u32 threads)
     : GenericEnvironment{gpu_memory_, program_base_, 0}, kepler_compute{&kepler_compute_} {
     using namespace Shader::Ampere;
     stage = Shader::Stage::Compute;
-    workgroup_size = {32, 1, 1};
+    // The lane count the mesh registers give the stage (SET_MESH_INIT_SHADER / SET_MESH_SHADER_B);
+    // the stage buffer layout stays in groups of 32 whatever it is.
+    workgroup_size = {std::clamp<u32>(threads, 1, 32), 1, 1};
     is_proprietary_driver = true;
     texture_bound = kepler_compute->regs.tex_cb_index;
     if (!gpu_memory->IsFullyMappedRange(program_base, header.size())) {

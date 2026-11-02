@@ -370,9 +370,10 @@ bool RasterizerVulkan::DrawEmulatedMesh(const VideoCommon::Nx2MeshEmulation::Dra
         .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
         .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
     };
-    const auto dispatch = [&](GPUVAddr program, bool has_task, u32 workgroups) {
-        qmd = ME::Launch(0, workgroups, bound, scratch, layout);
-        ComputePipeline* const pipeline = pipeline_cache.MeshEmulationComputePipeline(program, has_task);
+    const auto dispatch = [&](GPUVAddr program, bool has_task, u32 workgroups, u32 threads) {
+        qmd = ME::Launch(0, workgroups, threads, bound, scratch, layout);
+        ComputePipeline* const pipeline =
+            pipeline_cache.MeshEmulationComputePipeline(program, has_task, threads);
         if (!pipeline) {
             return fail("compute pipeline unavailable");
         }
@@ -394,10 +395,10 @@ bool RasterizerVulkan::DrawEmulatedMesh(const VideoCommon::Nx2MeshEmulation::Dra
     if (draw.MeshWorkgroups() > max_dim[0]) {
         return fail("too many mesh workgroups");
     }
-    if (draw.HasTask() && !dispatch(draw.task_program, false, draw.TaskWorkgroups())) {
+    if (draw.HasTask() && !dispatch(draw.task_program, false, draw.TaskWorkgroups(), draw.mesh.task_threads)) {
         return false;
     }
-    if (!dispatch(draw.mesh_program, draw.HasTask(), draw.MeshWorkgroups())) {
+    if (!dispatch(draw.mesh_program, draw.HasTask(), draw.MeshWorkgroups(), draw.mesh.mesh_threads)) {
         return false;
     }
     scheduler.Record([](vk::CommandBuffer cmdbuf) {

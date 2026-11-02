@@ -121,7 +121,8 @@ public:
     // Task/mesh emulation (EDEN_NX2_MESH_EMU=1, video_core/nx2_mesh_emulation.h). The rewritten
     // task or mesh program at `program` as a compute pipeline; the launch description must
     // already be the one the dispatch will use (its constant buffers are read at translation).
-    [[nodiscard]] ComputePipeline* MeshEmulationComputePipeline(GPUVAddr program, bool has_task);
+    [[nodiscard]] ComputePipeline* MeshEmulationComputePipeline(GPUVAddr program, bool has_task,
+                                                                 u32 threads);
 
     // The replay draw's pipeline: the generated passthrough vertex program for `mesh_header`
     // with the title's fragment program at `fragment_program`, over the current fixed state.

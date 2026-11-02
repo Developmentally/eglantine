@@ -618,21 +618,22 @@ ComputePipeline* PipelineCache::CurrentComputePipeline() {
     return pipeline.get();
 }
 
-ComputePipeline* PipelineCache::MeshEmulationComputePipeline(GPUVAddr program, bool has_task) {
+ComputePipeline* PipelineCache::MeshEmulationComputePipeline(GPUVAddr program, bool has_task,
+                                                             u32 threads) {
     // Keyed apart from the shader cache, whose memo for this very address holds its rejection
     // as a graphics stage. A failed build is remembered as null.
-    const u64 slot_key = program ^ (has_task ? 1ULL << 63 : 0);
+    const u64 slot_key = program ^ (has_task ? 1ULL << 63 : 0) ^ (u64{threads & 0x3f} << 56);
     const auto [pair, is_new] = mesh_compute_cache.try_emplace(slot_key);
     auto& pipeline = pair->second;
     if (!is_new) {
         return pipeline.get();
     }
     try {
-        VideoCommon::MeshEmulationEnvironment env{*kepler_compute, *gpu_memory, program, has_task};
+        VideoCommon::MeshEmulationEnvironment env{*kepler_compute, *gpu_memory, program, has_task, threads};
         const ComputePipelineCacheKey key{
             .unique_hash = env.CalculateHash(),
             .shared_memory_size = 0,
-            .workgroup_size{32, 1, 1},
+            .workgroup_size = env.WorkgroupSize(),
         };
         main_pools.ReleaseContents();
         pipeline = CreateComputePipeline(main_pools, key, env, nullptr, false);

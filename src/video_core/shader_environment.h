@@ -188,7 +188,7 @@ class MeshEmulationEnvironment final : public GenericEnvironment {
 public:
     explicit MeshEmulationEnvironment(Tegra::Engines::KeplerCompute& kepler_compute_,
                                       Tegra::MemoryManager& gpu_memory_, GPUVAddr program_base_,
-                                      bool has_task);
+                                      bool has_task, u32 threads);
 
     ~MeshEmulationEnvironment() override = default;
 
