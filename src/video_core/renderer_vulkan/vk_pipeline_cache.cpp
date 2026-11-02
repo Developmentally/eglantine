@@ -639,19 +639,28 @@ GraphicsPipeline* PipelineCache::BatchedGraphicsPipeline(
         // any, would have to pass it on too; not supported).
         if (current_pipeline == nullptr || program != 4 || graphics_key.unique_hashes[2] != 0 ||
             graphics_key.unique_hashes[3] != 0) {
+            LOG_WARNING(Render_Vulkan, "Batched pipeline: draw index cannot reach program slot {}", program);
             return nullptr;
         }
+        // One the vertex program does not write (a pass-through geometry program reads them
+        // all, so "unread" is only a preference).
         const auto& infos{current_pipeline->StageInfos()};
         u32 attribute{~0U};
-        for (u32 generic = 31; generic != ~0U; --generic) {
-            const auto base{static_cast<Shader::IR::Attribute>(
-                static_cast<u32>(Shader::IR::Attribute::Generic0X) + generic * 4)};
-            if (!infos[0].stores.AnyComponent(base) && !infos[program - 1].loads.AnyComponent(base)) {
+        for (const bool prefer_unread : {true, false}) {
+            for (u32 generic = 31; generic != ~0U && attribute == ~0U; --generic) {
+                const auto base{static_cast<Shader::IR::Attribute>(
+                    static_cast<u32>(Shader::IR::Attribute::Generic0X) + generic * 4)};
+                if (infos[0].stores.AnyComponent(base)) {
+                    continue;
+                }
+                if (prefer_unread && infos[program - 1].loads.AnyComponent(base)) {
+                    continue;
+                }
                 attribute = generic;
-                break;
             }
         }
         if (attribute == ~0U) {
+            LOG_WARNING(Render_Vulkan, "Batched pipeline: no free generic attribute for the draw index");
             return nullptr;
         }
         stage_table.draw_id_attribute = attribute;
