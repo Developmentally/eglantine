@@ -898,8 +898,11 @@ void RasterizerVulkan::DrawChunkBatch(ChunkBatch& batch) {
             VideoCommon::ObtainBufferOperation::DoNothing);
         buffer_cache.runtime.BindIndexBuffer(topology, index_format, draw.first_index, draw.index_count,
                                              index_buffer->Handle(), index_offset, index_bytes);
-        scheduler.Record([draw, index](vk::CommandBuffer cmdbuf) {
-            cmdbuf.DrawIndexed(draw.index_count, 1, draw.first_index, static_cast<u32>(draw.base_vertex), index);
+        // EDEN_NX2_CHUNK_BATCH_ROW0=1: every draw reads row 0 (experiments: wrong deltas, but
+        // tells a broken row path from a broken multi-draw path).
+        static const bool row0 = std::getenv("EDEN_NX2_CHUNK_BATCH_ROW0") != nullptr;
+        scheduler.Record([draw, row = row0 ? 0U : index](vk::CommandBuffer cmdbuf) {
+            cmdbuf.DrawIndexed(draw.index_count, 1, draw.first_index, static_cast<u32>(draw.base_vertex), row);
         });
     }
 }
