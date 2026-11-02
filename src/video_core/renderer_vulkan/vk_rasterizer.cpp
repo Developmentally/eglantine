@@ -616,6 +616,23 @@ bool RasterizerVulkan::BeginChunkBatch(const ChunkPattern& pattern) {
                  fmt::join(std::span{pattern.slots.data(), pattern.num_slots}, ","),
                  fmt::join(std::span{batch.span_size.data(), pattern.num_slots}, ","), batch.index_format);
     }
+    // EDEN_NX2_CHUNK_BATCH_VERIFY=1: remember the state the batch opened with, to compare at the
+    // flush (diagnostic).
+    static const bool verify = std::getenv("EDEN_NX2_CHUNK_BATCH_VERIFY") != nullptr;
+    if (verify) {
+        const auto& draw_state = maxwell3d->draw_manager.draw_state;
+        batch.regs_snapshot = std::make_unique<std::array<u32, Maxwell::NUM_REGS>>(regs.reg_array);
+        batch.draw_snapshot = {static_cast<u32>(draw_state.topology), draw_state.base_index, draw_state.base_instance,
+                               draw_state.instance_count, static_cast<u32>(draw_state.draw_mode),
+                               static_cast<u32>(draw_state.inline_index_draw_indexes.size())};
+        for (size_t st = 0; st < Maxwell::MaxShaderStage; ++st) {
+            for (u32 b = 0; b < Maxwell::MaxConstBuffers; ++b) {
+                const auto& c = maxwell3d->state.shader_stages[st].const_buffers[b];
+                batch.cbuf_snapshot[st * Maxwell::MaxConstBuffers + b] = c.enabled ? c.address ^ (u64{c.size} << 48) : 0;
+            }
+        }
+        batch.dirty_snapshot = maxwell3d->dirty.flags;
+    }
     chunk_batches.push_back(std::move(batch));
     // Any other register write flushes the batches before it changes the state they ran with.
     auto& guard = maxwell3d->batched_draw_guard;
@@ -726,6 +743,44 @@ void RasterizerVulkan::DrawChunkBatch(ChunkBatch& batch) {
     const u32 count = static_cast<u32>(batch.commands.size());
     if (count == 0) {
         return;
+    }
+    if (batch.regs_snapshot) {
+        static u32 verified{};
+        if (verified++ < 12) {
+            const auto& regs = maxwell3d->regs;
+            const auto& draw_state = maxwell3d->draw_manager.draw_state;
+            std::string diff;
+            u32 differing = 0;
+            for (u32 i = 0; i < Maxwell::NUM_REGS; ++i) {
+                if ((*batch.regs_snapshot)[i] != regs.reg_array[i]) {
+                    if (differing++ < 12) {
+                        diff += fmt::format(" r{:#x}:{:#x}->{:#x}", i, (*batch.regs_snapshot)[i], regs.reg_array[i]);
+                    }
+                }
+            }
+            std::string cbufs;
+            for (size_t st = 0; st < Maxwell::MaxShaderStage; ++st) {
+                for (u32 b = 0; b < Maxwell::MaxConstBuffers; ++b) {
+                    const auto& c = maxwell3d->state.shader_stages[st].const_buffers[b];
+                    const u64 now = c.enabled ? c.address ^ (u64{c.size} << 48) : 0;
+                    if (now != batch.cbuf_snapshot[st * Maxwell::MaxConstBuffers + b]) {
+                        cbufs += fmt::format(" s{}b{}", st, b);
+                    }
+                }
+            }
+            const std::array<u32, 6> now{static_cast<u32>(draw_state.topology), draw_state.base_index, draw_state.base_instance,
+                                         draw_state.instance_count, static_cast<u32>(draw_state.draw_mode),
+                                         static_cast<u32>(draw_state.inline_index_draw_indexes.size())};
+            u32 dirty_new = 0;
+            for (size_t f = 0; f < batch.dirty_snapshot.size(); ++f) {
+                dirty_new += !batch.dirty_snapshot[f] && maxwell3d->dirty.flags[f];
+            }
+            LOG_INFO(HW_GPU,
+                     "Chunk batch verify ({} draws): {} registers differ{}; cbuf bindings changed:{}; draw state "
+                     "topology/base_index/base_instance/instances/mode/inline {} -> {}; dirty flags newly set {}",
+                     count, differing, diff, cbufs.empty() ? " none" : cbufs, fmt::join(batch.draw_snapshot, "/"),
+                     fmt::join(now, "/"), dirty_new);
+        }
     }
     static u32 dumped{};
     if (dumped < 4) {

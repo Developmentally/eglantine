@@ -211,6 +211,11 @@ private:
         };
         std::vector<IndexCopy> index_copies;  ///< every draw's indices, gathered into the arena
         u32 arena_used{};
+        // EDEN_NX2_CHUNK_BATCH_VERIFY: the state at Begin, compared at the flush.
+        std::unique_ptr<std::array<u32, Tegra::Engines::Maxwell3D::Regs::NUM_REGS>> regs_snapshot;
+        std::array<u32, 6> draw_snapshot{};
+        std::array<u64, Tegra::Engines::Maxwell3D::Regs::MaxShaderStage * Tegra::Engines::Maxwell3D::Regs::MaxConstBuffers> cbuf_snapshot{};
+        Tegra::Engines::Maxwell3D::DirtyState::Flags dirty_snapshot;
         GraphicsPipeline* pipeline{};
     };
     /// Batches open at once (one per patched constant buffer and slot set in practice); the
