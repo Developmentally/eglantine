@@ -5,6 +5,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <bit>
 #include <cmath>
 #include <array>
 #include <memory>
@@ -876,10 +877,17 @@ void RasterizerVulkan::DrawChunkBatch(ChunkBatch& batch) {
     }
     UpdateDynamicStates();
     query_cache.NotifySegment(true);
-    scheduler.RequestRenderpass(texture_cache.GetFramebuffer());
     const auto& regs = maxwell3d->regs;
     const auto topology = maxwell3d->draw_manager.draw_state.topology;
     const auto index_format = regs.index_buffer.format;
+    // Every draw's buffers are obtained first: an upload ends the render pass, and a draw
+    // recorded outside one is lost.
+    struct Bound {
+        VkBuffer handle;
+        u32 offset;
+    };
+    boost::container::small_vector<Bound, 1024> bound;
+    bound.reserve(count * (1 + std::popcount(batch.stream_mask)));
     for (u32 index = 0; index < count; ++index) {
         const ChunkBatch::Draw& draw = batch.draws[index];
         for (u32 i = 0; i < Maxwell::NumVertexArrays; ++i) {
@@ -889,40 +897,33 @@ void RasterizerVulkan::DrawChunkBatch(ChunkBatch& batch) {
             const auto [buffer, offset] = buffer_cache.ObtainBuffer(
                 draw.vb_address[i], draw.vb_size[i], VideoCommon::ObtainBufferSynchronize::FullSynchronize,
                 VideoCommon::ObtainBufferOperation::DoNothing);
-            buffer_cache.runtime.BindVertexBuffer(i, buffer->Handle(), offset, draw.vb_size[i],
-                                                  regs.vertex_streams[i].stride);
+            bound.push_back({buffer->Handle(), offset});
         }
         const u32 index_bytes = (draw.first_index + draw.index_count) << batch.index_shift;
         const auto [index_buffer, index_offset] = buffer_cache.ObtainBuffer(
             draw.index_address, index_bytes, VideoCommon::ObtainBufferSynchronize::FullSynchronize,
             VideoCommon::ObtainBufferOperation::DoNothing);
-        static u32 logged_draws{};
-        if (logged_draws < 24) {
-            ++logged_draws;
-            LOG_INFO(HW_GPU,
-                     "Chunk draw {}/{}: indices {:#x} (+{:#x} in {}) first {} count {} base vertex {}; vb0 {:#x}+{:#x} "
-                     "stride {} vb1 {:#x}+{:#x}; row {}",
-                     index, count, draw.index_address, index_offset, fmt::ptr(index_buffer->Handle()), draw.first_index,
-                     draw.index_count, draw.base_vertex, draw.vb_address[0], draw.vb_size[0],
-                     regs.vertex_streams[0].stride.Value(), draw.vb_address[1], draw.vb_size[1],
-                     batch.rows[index * ChunkBatch::MaxSlots]);
+        bound.push_back({index_buffer->Handle(), index_offset});
+    }
+    scheduler.RequestRenderpass(texture_cache.GetFramebuffer());
+    // EDEN_NX2_CHUNK_BATCH_ROW0=1: every draw reads row 0 (experiments: wrong deltas, but tells a
+    // broken row path from a broken multi-draw path).
+    static const bool row0 = std::getenv("EDEN_NX2_CHUNK_BATCH_ROW0") != nullptr;
+    size_t next = 0;
+    for (u32 index = 0; index < count; ++index) {
+        const ChunkBatch::Draw& draw = batch.draws[index];
+        for (u32 i = 0; i < Maxwell::NumVertexArrays; ++i) {
+            if (((batch.stream_mask >> i) & 1) == 0) {
+                continue;
+            }
+            const Bound& vb = bound[next++];
+            buffer_cache.runtime.BindVertexBuffer(i, vb.handle, vb.offset, draw.vb_size[i],
+                                                  regs.vertex_streams[i].stride);
         }
-        static u32 logged_draws{};
-        if (logged_draws < 24) {
-            ++logged_draws;
-            LOG_INFO(HW_GPU,
-                     "Chunk draw {}/{}: indices {:#x} (+{:#x} in {}) first {} count {} base vertex {}; vb0 {:#x}+{:#x} "
-                     "stride {} vb1 {:#x}+{:#x}; row {}",
-                     index, count, draw.index_address, index_offset, fmt::ptr(index_buffer->Handle()), draw.first_index,
-                     draw.index_count, draw.base_vertex, draw.vb_address[0], draw.vb_size[0],
-                     regs.vertex_streams[0].stride.Value(), draw.vb_address[1], draw.vb_size[1],
-                     batch.rows[index * ChunkBatch::MaxSlots]);
-        }
-        buffer_cache.runtime.BindIndexBuffer(topology, index_format, draw.first_index, draw.index_count,
-                                             index_buffer->Handle(), index_offset, index_bytes);
-        // EDEN_NX2_CHUNK_BATCH_ROW0=1: every draw reads row 0 (experiments: wrong deltas, but
-        // tells a broken row path from a broken multi-draw path).
-        static const bool row0 = std::getenv("EDEN_NX2_CHUNK_BATCH_ROW0") != nullptr;
+        const Bound& ib = bound[next++];
+        const u32 index_bytes = (draw.first_index + draw.index_count) << batch.index_shift;
+        buffer_cache.runtime.BindIndexBuffer(topology, index_format, draw.first_index, draw.index_count, ib.handle,
+                                             ib.offset, index_bytes);
         scheduler.Record([draw, row = row0 ? 0U : index](vk::CommandBuffer cmdbuf) {
             cmdbuf.DrawIndexed(draw.index_count, 1, draw.first_index, static_cast<u32>(draw.base_vertex), row);
         });
