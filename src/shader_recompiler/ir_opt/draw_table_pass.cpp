@@ -81,13 +81,14 @@ void DrawTablePass(Environment& env, IR::Program& program) {
         return;
     }
     if (table.forward_draw_id) {
-        // Vertex program of a batched pipeline: gl_DrawID goes out as a flat varying for the
-        // patched stage. Stored at the entry; outputs have no ordering.
+        // Vertex program of a batched pipeline: gl_DrawID goes out as a varying for the patched
+        // stage, as an integer-valued float (exact below 2^24) rather than its bit pattern, which
+        // would be a denormal. Stored at the entry; outputs have no ordering.
         IR::Block* const entry{program.blocks.front()};
         IR::IREmitter ir{*entry, entry->begin()};
         const IR::U32 draw_id{ir.GetAttributeU32(IR::Attribute::DrawID)};
-        ir.SetAttribute(DrawIdAttribute(table.draw_id_attribute), ir.BitCast<IR::F32>(draw_id),
-                        ir.Imm32(0));
+        ir.SetAttribute(DrawIdAttribute(table.draw_id_attribute),
+                        IR::F32{ir.ConvertUToF(32, 32, draw_id)}, ir.Imm32(0));
     }
     if (table.num_slots == 0) {
         return;
@@ -136,7 +137,8 @@ void DrawTablePass(Environment& env, IR::Program& program) {
             const IR::U32 draw_id{
                 table.draw_id_attribute == ~0U
                     ? ir.GetAttributeU32(IR::Attribute::DrawID)
-                    : ir.BitCast<IR::U32>(ir.GetAttribute(DrawIdAttribute(table.draw_id_attribute), ir.Imm32(0)))};
+                    : IR::U32{ir.ConvertFToU(32, ir.GetAttribute(DrawIdAttribute(table.draw_id_attribute),
+                                                                ir.Imm32(0)))}};
             const IR::U32 row{ir.IMul(draw_id, ir.Imm32(table.stride))};
             const IR::U32 delta_offset{ir.IAdd(row, ir.Imm32(column * 4))};
             const IR::Value delta{&*block->PrependNewInst(
