@@ -94,7 +94,9 @@ void EnsureNx2MeshScratch(Core::System& system) {
         LOG_ERROR(Service_NVDRV, "Task/mesh scratch: no free GPU range for {:#x} bytes", size);
         return;
     }
-    static std::vector<std::unique_ptr<Kernel::KPageGroup>> page_groups; // live for the session
+    // Kept for the session and deliberately never destroyed: a static vector would finalize the
+    // page group at exit, after the kernel is gone.
+    static auto& page_groups = *new std::vector<std::unique_ptr<Kernel::KPageGroup>>();
     page_groups.push_back(std::move(pg));
     registry.SetMeshScratch({gpu_address, cpu_address, size});
     registry.MapAt(gpu_address, cpu_address, size);
