@@ -22,6 +22,12 @@ Those numbers collide like this:
 - **A Switch 2 game's guest memory alone is 7+ GB of host RSS.** Donkey Kong Bananza asks for a ~9.5 GiB heap at boot (the Switch 1 kernel limits in the emulator rejected it; we bound them by the intended memory size instead). On a 16 GB machine that already leaves less than half for the emulator, the JIT, the shader caches and every host-side GPU resource.
 - **Every GPU resource costs twice on a UMA host.** The guest's texture pool lives in RAM as guest memory, and its Vulkan image lives in RAM again as the host copy. Mario Kart World keeps ~2.6 GB of virtual-texture pools resident every frame (four 8192² RG16 and three 16384² R8 pools at 341 MiB each) plus 0.5-1.1 GB of GPU-decoded ASTC, and reserves 17 GB of GPU address space it never fully touches. A desktop GPU with its own VRAM never notices; the Deck does.
 - **Hitting the GTT pool is not a slowdown, it is a lockup.** When the GPU pool fills, `amdgpu_gem_create` starts evicting and swapping inside the ioctl, the GPU thread goes into D state, `kill -9` leaves a zombie holding 8 GB of GTT, SSH stops answering and only the power button helps. I rebooted the Deck a lot the first two nights.
+- **GPU accuracy affects threading.** On this branch, High GPU accuracy (the
+  default in some saved configurations) prevents the GPU front/back split from
+  starting. Low GPU accuracy allows the split with default DMA accuracy and
+  Vulkan; look for "GPU thread split: engine methods run on a second thread"
+  in the log. This changes emulation accuracy, so check rendering and
+  stability before using it for a game.
 - **The CPU is thin.** Four guest cores, a GPU front thread, a GPU back thread, a video decoder and audio all share four physical cores. Switch 2 titles are heavier on the CPU than Switch 1 titles. Check that SMT is actually on: a PowerTools profile had quietly turned it off on my Deck, and every number from the first two days was measured on four threads.
 - **RDNA2 is not Ampere.** Eglantine lowers Ampere programs to Maxwell IR and then to SPIR-V. Anything that has no Maxwell equivalent (task/mesh shaders, HMMA tensor ops, some newer opcodes) has to be emulated or replaced, and RADV has its own opinions about sparse images on an integrated GPU.
 
