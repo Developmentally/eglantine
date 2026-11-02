@@ -636,6 +636,16 @@ bool RasterizerVulkan::ExtendChunkBatch(const ChunkPattern& pattern) {
     const u64 index_need = u64{draw_state.index_buffer.first + draw_state.index_buffer.count} << batch.index_shift;
     if (index_address < batch.index_base || index_address + index_need > batch.index_base + batch.index_size) {
         ++chunk_batch_stats.miss_index;
+        static u32 logged_misses{};
+        if (logged_misses++ < 16) {
+            LOG_INFO(HW_GPU,
+                     "Chunk outside the index window: indices {:#x} first {} count {} format {} vs "
+                     "window {:#x}+{:#x} (mapping from the indices {:#x}, contiguous {})",
+                     index_address, draw_state.index_buffer.first, draw_state.index_buffer.count,
+                     batch.index_format, batch.index_base, batch.index_size,
+                     gpu_memory->GetMemoryLayoutSize(index_address),
+                     gpu_memory->IsContinuousRange(batch.index_base, index_address + index_need - batch.index_base));
+        }
         return false;
     }
     std::array<u32, ChunkBatch::MaxSlots> deltas{};
