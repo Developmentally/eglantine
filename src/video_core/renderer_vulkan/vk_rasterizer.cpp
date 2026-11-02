@@ -465,8 +465,11 @@ bool RasterizerVulkan::TryBatchChunkDraw(bool is_indexed, u32 instance_count) {
                         draw_state.draw_mode == Tegra::Engines::Maxwell3D::DrawManager::DrawMode::General;
     const auto pattern = simple ? MatchChunkPattern() : std::nullopt;
     if (pattern) {
+        // The batch draws every chunk with its own pipeline: a draw whose pipeline (from the
+        // same registers plus the shader programs) differs belongs to another batch.
+        GraphicsPipeline* const current = pipeline_cache.CurrentGraphicsPipeline();
         for (ChunkBatch& batch : chunk_batches) {
-            if (ExtendChunkBatch(batch, *pattern)) {
+            if (batch.base_pipeline == current && ExtendChunkBatch(batch, *pattern)) {
                 return true;
             }
         }
@@ -523,6 +526,11 @@ bool RasterizerVulkan::BeginChunkBatch(const ChunkPattern& pattern) {
     GraphicsPipeline* const base = pipeline_cache.CurrentGraphicsPipeline();
     if (!base || base->IsMeshPipeline()) {
         return false;
+    }
+    static u32 logged_bases{};
+    if (logged_bases < 16) {
+        ++logged_bases;
+        LOG_INFO(HW_GPU, "Chunk batch base pipeline {}", fmt::ptr(base));
     }
     const auto& regs = maxwell3d->regs;
     const GPUVAddr vertex_program =
@@ -582,6 +590,7 @@ bool RasterizerVulkan::BeginChunkBatch(const ChunkPattern& pattern) {
         return fail("constant buffer size");
     }
     ChunkBatch batch{};
+    batch.base_pipeline = base;
     batch.cbuf_address = pattern.cbuf_address;
     batch.cbuf_size = cbuf.size;
     batch.program = program;

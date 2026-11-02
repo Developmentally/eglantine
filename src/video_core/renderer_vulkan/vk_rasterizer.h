@@ -213,7 +213,8 @@ private:
             std::array<u32, Tegra::Engines::Maxwell3D::Regs::NumVertexArrays> vb_size{};
         };
         std::vector<Draw> draws;
-        GraphicsPipeline* pipeline{};
+        GraphicsPipeline* base_pipeline{};  ///< the game's pipeline for these draws
+        GraphicsPipeline* pipeline{};       ///< its patched variant
         // EDEN_NX2_CHUNK_BATCH_VERIFY: the state at Begin, compared at the flush.
         std::unique_ptr<std::array<u32, Tegra::Engines::Maxwell3D::Regs::NUM_REGS>> regs_snapshot;
         std::array<u32, 6> draw_snapshot{};
