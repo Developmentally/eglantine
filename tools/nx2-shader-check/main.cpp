@@ -33,6 +33,7 @@
 #include "shader_recompiler/environment.h"
 #include "shader_recompiler/exception.h"
 #include "shader_recompiler/frontend/ampere/lower_to_maxwell.h"
+#include "shader_recompiler/frontend/ampere/mesh_emulation.h"
 #include "shader_recompiler/frontend/ampere/program_address_map.h"
 #include "shader_recompiler/frontend/ampere/program_dump.h"
 #include "shader_recompiler/frontend/ir/program.h"
@@ -58,9 +59,19 @@ using Shader::Ampere::ProgramDumpInfo;
 // with the program header in front and the native address map behind.
 class DumpEnvironment final : public Shader::Environment {
 public:
-    DumpEnvironment(const ProgramDumpInfo& info, const Shader::Ampere::LoweredProgram& lowered) {
+    DumpEnvironment(const ProgramDumpInfo& info, const Shader::Ampere::LoweredProgram& lowered,
+                    std::span<const Instruction> native) {
         stage = static_cast<Shader::Stage>(info.stage);
         gp_passthrough_mask = info.gp_passthrough_mask;
+        // Task and mesh programs are dumped from the vertex slot; the dump carries neither the
+        // mesh registers nor the per-primitive header, so translate them with the shape the
+        // title's programs have: 32 lanes, triangles, 4 vertices and 2 primitives per lane.
+        if (const auto analysis = Shader::Ampere::MeshEmulation::Analyze(native);
+            stage != Shader::Stage::Compute && analysis) {
+            using Shader::Ampere::MeshEmulation::ProgramKind;
+            stage = analysis.kind == ProgramKind::Task ? Shader::Stage::Task : Shader::Stage::Mesh;
+            mesh_registers = {4U | (128U << 4) | (64U << 13), 32U << 20, 32U | (1U << 12) | (1U << 22)};
+        }
         std::memcpy(&sph, info.header.data(), sizeof(sph));
         start_address = sizeof(sph);
         is_proprietary_driver = true;
@@ -308,7 +319,7 @@ Outcome Check(const fs::path& path, bool lowering_only) {
         Shader::ObjectPool<Shader::IR::Inst> inst_pool;
         Shader::ObjectPool<Shader::IR::Block> block_pool;
         Shader::ObjectPool<Shader::Maxwell::Flow::Block> flow_pool;
-        DumpEnvironment env(info, lowered);
+        DumpEnvironment env(info, lowered, native);
         const auto host = HostInfo();
         outcome.phase = "translate";
         Shader::Maxwell::Flow::CFG cfg(env, flow_pool, env.StartAddress());
