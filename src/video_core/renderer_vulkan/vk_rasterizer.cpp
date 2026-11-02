@@ -608,6 +608,10 @@ bool RasterizerVulkan::BeginChunkBatch(const ChunkPattern& pattern) {
     for (u32 i = 0; i < Maxwell::NumVertexArrays; ++i) {
         if (regs.vertex_streams[i].IsEnabled()) {
             batch.stream_mask |= 1U << i;
+            // The row in the first instance would shift instanced attribute fetches.
+            if (regs.vertex_stream_instances.is_instanced[i] != 0) {
+                return fail("an instanced vertex stream");
+            }
         }
     }
     // Scratch: [constant buffer copy with span bases and the table pointer | table].
