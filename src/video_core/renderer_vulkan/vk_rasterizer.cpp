@@ -621,7 +621,14 @@ bool RasterizerVulkan::ExtendChunkBatch(ChunkBatch& batch, const ChunkPattern& p
             return false;
         }
     }
-    if (batch.commands.size() >= ChunkBatch::MaxDraws) {
+    // EDEN_NX2_CHUNK_BATCH_MAX_DRAWS: cap for experiments (1 = every draw alone, so only the
+    // table's first row is ever read).
+    static const u32 max_draws = [] {
+        const char* value = std::getenv("EDEN_NX2_CHUNK_BATCH_MAX_DRAWS");
+        const u32 n = value ? static_cast<u32>(std::strtoul(value, nullptr, 10)) : ChunkBatch::MaxDraws;
+        return std::clamp<u32>(n, 1, ChunkBatch::MaxDraws);
+    }();
+    if (batch.commands.size() >= max_draws) {
         return false;
     }
     const auto& regs = maxwell3d->regs;
@@ -707,6 +714,20 @@ void RasterizerVulkan::DrawChunkBatch(ChunkBatch& batch) {
     const u32 count = static_cast<u32>(batch.commands.size());
     if (count == 0) {
         return;
+    }
+    static u32 dumped{};
+    if (dumped < 4) {
+        ++dumped;
+        const auto& c = batch.commands.front();
+        LOG_INFO(HW_GPU,
+                 "Chunk batch of {} draws: scratch {:#x} table +{:#x} commands +{:#x} indices +{:#x} ({} bytes); "
+                 "spans {:#x}+{:#x}, {:#x}+{:#x}; row 0 deltas {:#x},{:#x}; command 0 indexCount {} "
+                 "firstIndex {} vertexOffset {} firstInstance {}; last row deltas {:#x},{:#x}",
+                 count, batch.scratch, batch.table_offset, batch.commands_offset, batch.indices_offset,
+                 batch.indices.size(), batch.span_base[0], batch.span_size[0], batch.span_base[1],
+                 batch.span_size[1], batch.rows[0], batch.rows[1], c.indexCount, c.firstIndex,
+                 c.vertexOffset, c.firstInstance, batch.rows[(count - 1) * ChunkBatch::MaxSlots],
+                 batch.rows[(count - 1) * ChunkBatch::MaxSlots + 1]);
     }
     // The copy, the table and the commands go through guest memory like any CPU-written buffer,
     // then the range is obtained with synchronization so the upload is recorded before the draw.
