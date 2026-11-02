@@ -8,6 +8,7 @@
 
 #include <array>
 #include <bitset>
+#include <functional>
 #include <cmath>
 #include <cstdlib>
 #include <limits>
@@ -3349,6 +3350,27 @@ public:
     void ClearWritesSinceDraw() { writes_since_draw.clear(); }
     std::vector<std::pair<u32, u32>> writes_since_draw;
     bool record_writes_since_draw{std::getenv("EDEN_NX2_DRAW_DELTA_LOG") != nullptr};
+
+    /// Draws the rasterizer holds back to submit together: the methods those draws may write
+    /// between them, and the flush to run before any other method changes the state they ran
+    /// with.
+    struct BatchedDrawGuard {
+        bool active{};
+        std::bitset<Regs::NUM_REGS> methods;
+        std::function<void()> flush;
+    } batched_draw_guard;
+    void GuardBatchedDraws(u32 method, u32 amount = 1) {
+        if (!batched_draw_guard.active) [[likely]] {
+            return;
+        }
+        for (u32 m = method; m < method + amount; ++m) {
+            if (m >= Regs::NUM_REGS || !batched_draw_guard.methods[m]) {
+                batched_draw_guard.flush();
+                return;
+            }
+        }
+    }
+
 
 private:
     size_t recent_write_index = 0;

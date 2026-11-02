@@ -495,10 +495,12 @@ void Maxwell3D::CallMethod(Core::System& system, u32 method, u32 method_argument
     if (!execution_mask[method]) {
         // ProcessMethodCall (and the draw manager behind it) acts only on executable methods.
         if (!SkipSameValueWrites() || regs.reg_array[method] != argument) {
+            GuardBatchedDraws(method);
             ProcessDirtyRegisters(method, argument);
         }
         return;
     }
+    GuardBatchedDraws(method);
     ProcessDirtyRegisters(method, argument);
     ProcessMethodCall(method, argument, method_argument, is_last_call);
 }
@@ -527,6 +529,9 @@ void Maxwell3D::CallMultiMethod(Core::System& system, u32 method, const u32* bas
     }
     // Methods after 0xE00 are special, they're actually triggers for some microcode that was
     // uploaded to the GPU during initialization.
+    if (method < MacroRegistersStart) {
+        GuardBatchedDraws(method, amount);
+    }
     if (method >= MacroRegistersStart) {
         ProcessMacro(system, method, base_start, amount, amount == methods_pending);
         return;

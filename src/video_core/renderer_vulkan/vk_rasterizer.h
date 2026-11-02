@@ -7,6 +7,7 @@
 #pragma once
 
 #include <array>
+#include <bitset>
 #include <chrono>
 #include <optional>
 #include <vector>
@@ -184,7 +185,6 @@ private:
     struct ChunkBatch {
         static constexpr u32 MaxDraws = 4096;
         static constexpr u32 MaxSlots = 4;
-        bool active{};
         GPUVAddr cbuf_address{};  ///< the patched constant buffer (CB_ADDRESS of the pattern)
         u32 cbuf_size{};
         size_t program{};         ///< program slot whose bank it is
@@ -198,18 +198,27 @@ private:
         u32 index_shift{};
         u32 index_format{};
         GPUVAddr scratch{};       ///< [cbuf copy | table | indirect commands]
+        u64 scratch_size{};
         u32 table_offset{};
         u32 commands_offset{};
         std::vector<u8> cbuf_copy;
         std::vector<u32> rows;    ///< MaxSlots u32 per draw
         std::vector<VkDrawIndexedIndirectCommand> commands;
-        const Framebuffer* framebuffer{};
-    } chunk_batch;
+        GraphicsPipeline* pipeline{};
+    };
+    /// Batches open at once: consecutive chunk draws rotate through several index buffers, each
+    /// in its own mapping, and the geometry shader only appends to each chunk's own record, so
+    /// the draws of different batches may be reordered.
+    static constexpr size_t MaxOpenChunkBatches = 8;
+    std::vector<ChunkBatch> chunk_batches;
+    /// Windows found for pointers, per 64 KiB of pointer; cleared when mappings change.
+    std::unordered_map<GPUVAddr, std::pair<GPUVAddr, u64>> chunk_window_cache;
     struct ChunkBatchStats {
         std::chrono::steady_clock::time_point window{std::chrono::steady_clock::now()};
+        u64 flushes{};
         u64 batches{};
         u64 draws{};
-        u64 ended_by_miss{};  ///< a chunk draw whose records or indices fell outside the windows
+        u64 ended_by_miss{};  ///< a chunk draw outside every open batch, with none free
         u64 ended_by_draw{};  ///< a draw that is not a chunk draw
         u64 miss_index{};
         std::array<u64, ChunkBatch::MaxSlots> miss_slot{};
@@ -224,8 +233,10 @@ private:
     /// True when the current draw was taken into a batch (begun or extended).
     bool TryBatchChunkDraw(bool is_indexed, u32 instance_count);
     bool BeginChunkBatch(const ChunkPattern& pattern);
-    bool ExtendChunkBatch(const ChunkPattern& pattern);
-    void FlushChunkBatch();
+    bool ExtendChunkBatch(ChunkBatch& batch, const ChunkPattern& pattern);
+    void FlushChunkBatches();
+    void DrawChunkBatch(ChunkBatch& batch);
+    std::optional<std::pair<GPUVAddr, u64>> ChunkWindow(GPUVAddr pointer, u64 need);
 
     void FlushWork();
 

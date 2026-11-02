@@ -352,19 +352,36 @@ std::optional<std::pair<GPUVAddr, u64>> MappedWindow(const Tegra::MemoryManager&
     }
     return std::pair{base, lo - base};
 }
+// The registers a chunk draw writes between two draws of a run.
+constexpr u32 RegIndex(size_t byte_offset) {
+    return static_cast<u32>(byte_offset / sizeof(u32));
+}
+namespace ChunkMethods {
+constexpr u32 CbOffset = RegIndex(offsetof(Maxwell, const_buffer.offset));
+constexpr u32 CbData = RegIndex(offsetof(Maxwell, const_buffer.buffer));
+constexpr u32 CbDataWords = 16;
+constexpr u32 IndexHigh = RegIndex(offsetof(Maxwell, index_buffer.start_addr_high));
+constexpr u32 IndexLow = RegIndex(offsetof(Maxwell, index_buffer.start_addr_low));
+constexpr u32 IndexFirst = RegIndex(offsetof(Maxwell, index_buffer.first));
+constexpr u32 IndexCount = RegIndex(offsetof(Maxwell, index_buffer.count));
+constexpr u32 DrawBegin = RegIndex(offsetof(Maxwell, draw.begin));
+constexpr u32 DrawEnd = RegIndex(offsetof(Maxwell, draw.end));
+
+std::bitset<Maxwell::NUM_REGS> Set() {
+    std::bitset<Maxwell::NUM_REGS> set;
+    for (const u32 method : {CbOffset, IndexHigh, IndexLow, IndexFirst, IndexCount, DrawBegin, DrawEnd}) {
+        set.set(method);
+    }
+    for (u32 word = 0; word < CbDataWords; ++word) {
+        set.set(CbData + word);
+    }
+    return set;
+}
+} // namespace ChunkMethods
 } // Anonymous namespace
 
 std::optional<RasterizerVulkan::ChunkPattern> RasterizerVulkan::MatchChunkPattern() const {
-    constexpr auto Index = [](size_t byte_offset) { return static_cast<u32>(byte_offset / sizeof(u32)); };
-    constexpr u32 CbOffset = Index(offsetof(Maxwell, const_buffer.offset));
-    constexpr u32 CbData = Index(offsetof(Maxwell, const_buffer.buffer));
-    constexpr u32 CbDataWords = 16;
-    constexpr u32 IndexHigh = Index(offsetof(Maxwell, index_buffer.start_addr_high));
-    constexpr u32 IndexLow = Index(offsetof(Maxwell, index_buffer.start_addr_low));
-    constexpr u32 IndexFirst = Index(offsetof(Maxwell, index_buffer.first));
-    constexpr u32 IndexCount = Index(offsetof(Maxwell, index_buffer.count));
-    constexpr u32 DrawBegin = Index(offsetof(Maxwell, draw.begin));
-    constexpr u32 DrawEnd = Index(offsetof(Maxwell, draw.end));
+    using namespace ChunkMethods;
     const auto& writes = maxwell3d->WritesSinceDraw();
     if (writes.empty() || writes.size() >= 256) {
         return std::nullopt;
@@ -425,14 +442,37 @@ bool RasterizerVulkan::TryBatchChunkDraw(bool is_indexed, u32 instance_count) {
                         draw_state.inline_index_draw_indexes.empty() &&
                         draw_state.draw_mode == Tegra::Engines::Maxwell3D::DrawManager::DrawMode::General;
     const auto pattern = simple ? MatchChunkPattern() : std::nullopt;
-    if (chunk_batch.active) {
-        if (pattern && ExtendChunkBatch(*pattern)) {
-            return true;
+    if (pattern) {
+        for (ChunkBatch& batch : chunk_batches) {
+            if (ExtendChunkBatch(batch, *pattern)) {
+                return true;
+            }
         }
+    }
+    if (!chunk_batches.empty() && (!pattern || chunk_batches.size() == MaxOpenChunkBatches)) {
         ++(pattern ? chunk_batch_stats.ended_by_miss : chunk_batch_stats.ended_by_draw);
-        FlushChunkBatch();
+        FlushChunkBatches();
     }
     return pattern && BeginChunkBatch(*pattern);
+}
+
+std::optional<std::pair<GPUVAddr, u64>> RasterizerVulkan::ChunkWindow(GPUVAddr pointer, u64 need) {
+    if (ChunkBatchingMode() == 2) {
+        return MappedWindow(*gpu_memory, pointer, need);
+    }
+    // Finding a window walks page tables over tens of MiB; remember it per 64 KiB of pointers.
+    const GPUVAddr key = Common::AlignDown(pointer, 0x10000);
+    if (const auto it = chunk_window_cache.find(key); it != chunk_window_cache.end()) {
+        const auto [base, size] = it->second;
+        if (pointer >= base && pointer + need <= base + size) {
+            return it->second;
+        }
+    }
+    const auto window = MappedWindow(*gpu_memory, pointer, need);
+    if (window) {
+        chunk_window_cache[key] = *window;
+    }
+    return window;
 }
 
 bool RasterizerVulkan::BeginChunkBatch(const ChunkPattern& pattern) {
@@ -495,8 +535,7 @@ bool RasterizerVulkan::BeginChunkBatch(const ChunkPattern& pattern) {
     if (cbuf.size == 0 || cbuf.size > Maxwell::MaxConstBufferSize) {
         return fail("constant buffer size");
     }
-    auto& batch = chunk_batch;
-    batch = {};
+    ChunkBatch batch{};
     batch.cbuf_address = pattern.cbuf_address;
     batch.cbuf_size = cbuf.size;
     batch.program = program;
@@ -506,14 +545,13 @@ bool RasterizerVulkan::BeginChunkBatch(const ChunkPattern& pattern) {
     for (u32 k = 0; k < pattern.num_slots; ++k) {
         const GPUVAddr pointer = gpu_memory->Read<u64>(pattern.cbuf_address + pattern.slots[k]);
         const u32 size = gpu_memory->Read<u32>(pattern.cbuf_address + pattern.slots[k] + 8);
-        const auto window = MappedWindow(*gpu_memory, pointer, (std::max)(size, 16U));
+        const auto window = ChunkWindow(pointer, (std::max)(size, 16U));
         if (!window) {
             return fail("storage buffer unmapped");
         }
         batch.span_base[k] = window->first;
         batch.span_size[k] = window->second;
         batch.table.slots[k] = {bank, pattern.slots[k]};
-        buffer_cache.storage_buffer_sizes[window->first] = static_cast<u32>(window->second);
     }
     batch.table.num_slots = pattern.num_slots;
     const u32 table_slot_offset = Common::AlignUp(cbuf.size, 16U);
@@ -526,7 +564,7 @@ bool RasterizerVulkan::BeginChunkBatch(const ChunkPattern& pattern) {
     batch.index_shift = batch.index_format == 0 ? 0 : batch.index_format == 1 ? 1 : 2;
     const GPUVAddr index_address = index_regs.StartAddress();
     const u64 index_need = u64{draw_state.index_buffer.first + draw_state.index_buffer.count} << batch.index_shift;
-    const auto index_window = MappedWindow(*gpu_memory, index_address, index_need);
+    const auto index_window = ChunkWindow(index_address, index_need);
     if (!index_window) {
         return fail("index buffer unmapped");
     }
@@ -541,6 +579,7 @@ bool RasterizerVulkan::BeginChunkBatch(const ChunkPattern& pattern) {
     if (batch.scratch == 0) {
         return fail("no scratch");
     }
+    batch.scratch_size = total;
     batch.cbuf_copy.assign(copy_size, 0);
     gpu_memory->ReadBlockUnsafe(pattern.cbuf_address, batch.cbuf_copy.data(), cbuf.size);
     const auto put64 = [&](u32 at, u64 value) { std::memcpy(batch.cbuf_copy.data() + at, &value, sizeof(value)); };
@@ -551,58 +590,16 @@ bool RasterizerVulkan::BeginChunkBatch(const ChunkPattern& pattern) {
     put64(table_slot_offset, batch.scratch + batch.table_offset);
     put64(table_slot_offset + 8, u64{ChunkBatch::MaxDraws} * batch.table.stride);
 
-    // This draw's command, from the registers as the game left them (they are overridden below).
-    if (!ExtendChunkBatch(pattern)) {
-        return fail("first draw outside its windows");
-    }
-    GraphicsPipeline* const pipeline = pipeline_cache.BatchedGraphicsPipeline(program, batch.table);
-    if (!pipeline) {
+    batch.pipeline = pipeline_cache.BatchedGraphicsPipeline(program, batch.table);
+    if (!batch.pipeline) {
         return fail("no batched pipeline");
     }
-    // Configure with the copy in the bank and the index window bound; the state the game set is
-    // restored afterwards and the index buffer marked dirty so the next draw re-binds its own.
-    FlushWork();
-    AccelerateInlineToMemory(batch.scratch, copy_size, batch.cbuf_copy);
-    gpu_memory->FlushCaching();
-    auto& bound_cbuf = maxwell3d->state.shader_stages[stage].const_buffers[bank];
-    const auto saved_cbuf = bound_cbuf;
-    auto& index_mut = maxwell3d->regs.index_buffer;
-    const auto saved_index = index_mut;
-    auto& draw_state_mut = maxwell3d->draw_manager.draw_state;
-    const auto saved_index_state = draw_state_mut.index_buffer;
-    SCOPE_EXIT {
-        bound_cbuf = saved_cbuf;
-        buffer_cache.BindGraphicsUniformBuffer(stage, bank, saved_cbuf.address, saved_cbuf.size);
-        index_mut = saved_index;
-        draw_state_mut.index_buffer = saved_index_state;
-        maxwell3d->dirty.flags[VideoCommon::Dirty::IndexBuffer] = true;
-    };
-    bound_cbuf = {.address = batch.scratch, .size = copy_size, .enabled = true};
-    buffer_cache.BindGraphicsUniformBuffer(stage, bank, batch.scratch, copy_size);
-    index_mut.start_addr_high = static_cast<u32>(batch.index_base >> 32);
-    index_mut.start_addr_low = static_cast<u32>(batch.index_base);
-    const GPUVAddr index_end = batch.index_base + batch.index_size - 1;
-    index_mut.limit_addr_high = static_cast<u32>(index_end >> 32);
-    index_mut.limit_addr_low = static_cast<u32>(index_end);
-    draw_state_mut.index_buffer.first = 0;
-    draw_state_mut.index_buffer.count = static_cast<u32>(batch.index_size >> batch.index_shift);
-    maxwell3d->dirty.flags[VideoCommon::Dirty::IndexBuffer] = true;
-    {
-        std::scoped_lock lock{buffer_cache.mutex, texture_cache.mutex};
-        // One cached buffer over the whole slot, so the table and command regions bound and
-        // uploaded later live in the buffer the descriptors point at.
-        [[maybe_unused]] const auto whole_slot = buffer_cache.ObtainBuffer(
-            batch.scratch, static_cast<u32>(total), VideoCommon::ObtainBufferSynchronize::NoSynchronize,
-            VideoCommon::ObtainBufferOperation::DoNothing);
-        pipeline->SetEngine(maxwell3d, gpu_memory);
-        if (!pipeline->Configure(true)) {
-            return fail("configure failed");
-        }
-        UpdateDynamicStates();
-        query_cache.NotifySegment(true);
-        batch.framebuffer = texture_cache.GetFramebuffer();
+    if (!ExtendChunkBatch(batch, pattern)) {
+        return fail("first draw outside its windows");
     }
-    batch.active = true;
+    for (u32 k = 0; k < pattern.num_slots; ++k) {
+        buffer_cache.storage_buffer_sizes[batch.span_base[k]] = static_cast<u32>(batch.span_size[k]);
+    }
     if (logged < 32) {
         ++logged;
         LOG_INFO(HW_GPU, "Chunk batch started: vs {:#x} program slot {} bank {} cbuf {:#x} slots{} spans{} index window {:#x}+{:#x}",
@@ -611,11 +608,18 @@ bool RasterizerVulkan::BeginChunkBatch(const ChunkPattern& pattern) {
                  fmt::join(std::span{batch.span_size.data(), pattern.num_slots}, ","),
                  batch.index_base, batch.index_size);
     }
+    chunk_batches.push_back(std::move(batch));
+    // Any other register write flushes the batches before it changes the state they ran with.
+    auto& guard = maxwell3d->batched_draw_guard;
+    if (!guard.flush) {
+        guard.methods = ChunkMethods::Set();
+        guard.flush = [this] { FlushChunkBatches(); };
+    }
+    guard.active = true;
     return true;
 }
 
-bool RasterizerVulkan::ExtendChunkBatch(const ChunkPattern& pattern) {
-    auto& batch = chunk_batch;
+bool RasterizerVulkan::ExtendChunkBatch(ChunkBatch& batch, const ChunkPattern& pattern) {
     if (pattern.cbuf_address != batch.cbuf_address || pattern.num_slots != batch.table.num_slots) {
         return false;
     }
@@ -636,16 +640,6 @@ bool RasterizerVulkan::ExtendChunkBatch(const ChunkPattern& pattern) {
     const u64 index_need = u64{draw_state.index_buffer.first + draw_state.index_buffer.count} << batch.index_shift;
     if (index_address < batch.index_base || index_address + index_need > batch.index_base + batch.index_size) {
         ++chunk_batch_stats.miss_index;
-        static u32 logged_misses{};
-        if (logged_misses++ < 16) {
-            LOG_INFO(HW_GPU,
-                     "Chunk outside the index window: indices {:#x} first {} count {} format {} vs "
-                     "window {:#x}+{:#x} (mapping from the indices {:#x}, contiguous {})",
-                     index_address, draw_state.index_buffer.first, draw_state.index_buffer.count,
-                     batch.index_format, batch.index_base, batch.index_size,
-                     gpu_memory->GetMemoryLayoutSize(index_address),
-                     gpu_memory->IsContinuousRange(batch.index_base, index_address + index_need - batch.index_base));
-        }
         return false;
     }
     std::array<u32, ChunkBatch::MaxSlots> deltas{};
@@ -669,58 +663,106 @@ bool RasterizerVulkan::ExtendChunkBatch(const ChunkPattern& pattern) {
     return true;
 }
 
-void RasterizerVulkan::FlushChunkBatch() {
-    auto& batch = chunk_batch;
-    if (!batch.active) {
+void RasterizerVulkan::FlushChunkBatches() {
+    if (chunk_batches.empty()) {
         return;
     }
-    batch.active = false;
+    maxwell3d->batched_draw_guard.active = false;
+    // Taken out first: the uploads below pass through the flush hooks themselves.
+    std::vector<ChunkBatch> batches;
+    batches.swap(chunk_batches);
+    FlushWork();
+    for (ChunkBatch& batch : batches) {
+        DrawChunkBatch(batch);
+    }
     buffer_cache.storage_buffer_sizes.clear();
+    auto& stats = chunk_batch_stats;
+    stats.batches += batches.size();
+    for (const ChunkBatch& batch : batches) {
+        stats.draws += batch.commands.size();
+    }
+    ++stats.flushes;
+    if (const auto now = std::chrono::steady_clock::now(); now - stats.window > std::chrono::seconds{10}) {
+        LOG_INFO(HW_GPU,
+                 "Chunk batches in the last 10 s: {} flushes, {} batches, {} draws ({:.0f} per batch); "
+                 "flushed by a chunk outside every window {} (misses: indices {}, slots {}), by "
+                 "another draw {}, by other work {}",
+                 stats.flushes, stats.batches, stats.draws,
+                 stats.batches ? static_cast<double>(stats.draws) / static_cast<double>(stats.batches) : 0.0,
+                 stats.ended_by_miss, stats.miss_index, fmt::join(stats.miss_slot, ","),
+                 stats.ended_by_draw, stats.flushes - stats.ended_by_miss - stats.ended_by_draw);
+        stats = {.window = now};
+    }
+    gpu.TickWork();
+}
+
+void RasterizerVulkan::DrawChunkBatch(ChunkBatch& batch) {
     const u32 count = static_cast<u32>(batch.commands.size());
     if (count == 0) {
         return;
     }
-    // The table and the commands go through guest memory like any CPU-written buffer, then the
-    // range is obtained with synchronization so the upload is recorded before the draw.
+    // The copy, the table and the commands go through guest memory like any CPU-written buffer,
+    // then the range is obtained with synchronization so the upload is recorded before the draw.
+    const u32 copy_size = static_cast<u32>(batch.cbuf_copy.size());
     const u32 rows_bytes = count * batch.table.stride;
     const u32 commands_bytes = count * static_cast<u32>(sizeof(VkDrawIndexedIndirectCommand));
+    AccelerateInlineToMemory(batch.scratch, copy_size, batch.cbuf_copy);
     AccelerateInlineToMemory(batch.scratch + batch.table_offset, rows_bytes,
                              std::span{reinterpret_cast<const u8*>(batch.rows.data()), rows_bytes});
     AccelerateInlineToMemory(batch.scratch + batch.commands_offset, commands_bytes,
                              std::span{reinterpret_cast<const u8*>(batch.commands.data()), commands_bytes});
     gpu_memory->FlushCaching();
+    // Configure with the copy in the bank and the index window bound; the state the game set is
+    // restored afterwards and the index buffer marked dirty so the next draw re-binds its own.
+    auto& bound_cbuf = maxwell3d->state.shader_stages[batch.stage].const_buffers[batch.bank];
+    const auto saved_cbuf = bound_cbuf;
+    auto& index_mut = maxwell3d->regs.index_buffer;
+    const auto saved_index = index_mut;
+    auto& draw_state_mut = maxwell3d->draw_manager.draw_state;
+    const auto saved_index_state = draw_state_mut.index_buffer;
+    SCOPE_EXIT {
+        bound_cbuf = saved_cbuf;
+        buffer_cache.BindGraphicsUniformBuffer(batch.stage, batch.bank, saved_cbuf.address, saved_cbuf.size);
+        index_mut = saved_index;
+        draw_state_mut.index_buffer = saved_index_state;
+        maxwell3d->dirty.flags[VideoCommon::Dirty::IndexBuffer] = true;
+    };
+    bound_cbuf = {.address = batch.scratch, .size = copy_size, .enabled = true};
+    buffer_cache.BindGraphicsUniformBuffer(batch.stage, batch.bank, batch.scratch, copy_size);
+    index_mut.start_addr_high = static_cast<u32>(batch.index_base >> 32);
+    index_mut.start_addr_low = static_cast<u32>(batch.index_base);
+    const GPUVAddr index_end = batch.index_base + batch.index_size - 1;
+    index_mut.limit_addr_high = static_cast<u32>(index_end >> 32);
+    index_mut.limit_addr_low = static_cast<u32>(index_end);
+    draw_state_mut.index_buffer.first = 0;
+    draw_state_mut.index_buffer.count = static_cast<u32>(batch.index_size >> batch.index_shift);
+    maxwell3d->dirty.flags[VideoCommon::Dirty::IndexBuffer] = true;
     std::scoped_lock lock{buffer_cache.mutex, texture_cache.mutex};
+    // One cached buffer over the whole slot, so the table and command regions live in the buffer
+    // the descriptors point at.
+    [[maybe_unused]] const auto whole_slot = buffer_cache.ObtainBuffer(
+        batch.scratch, static_cast<u32>(batch.scratch_size), VideoCommon::ObtainBufferSynchronize::NoSynchronize,
+        VideoCommon::ObtainBufferOperation::DoNothing);
     const u32 upload_size = batch.commands_offset + commands_bytes - batch.table_offset;
     [[maybe_unused]] const auto uploaded = buffer_cache.ObtainBuffer(
         batch.scratch + batch.table_offset, upload_size,
         VideoCommon::ObtainBufferSynchronize::FullSynchronize,
         VideoCommon::ObtainBufferOperation::DoNothing);
+    batch.pipeline->SetEngine(maxwell3d, gpu_memory);
+    if (!batch.pipeline->Configure(true)) {
+        LOG_WARNING(HW_GPU, "Chunk batch of {} draws dropped: configure failed", count);
+        return;
+    }
+    UpdateDynamicStates();
+    query_cache.NotifySegment(true);
     const auto [buffer, offset] = buffer_cache.ObtainBuffer(
         batch.scratch + batch.commands_offset, commands_bytes,
-        VideoCommon::ObtainBufferSynchronize::FullSynchronize,
+        VideoCommon::ObtainBufferSynchronize::NoSynchronize,
         VideoCommon::ObtainBufferOperation::DoNothing);
-    // The uploads may have left the render pass the batch was configured in.
-    scheduler.RequestRenderpass(batch.framebuffer);
+    scheduler.RequestRenderpass(texture_cache.GetFramebuffer());
     scheduler.Record([handle = buffer->Handle(), offset, count](vk::CommandBuffer cmdbuf) {
         cmdbuf.DrawIndexedIndirect(handle, offset, count, sizeof(VkDrawIndexedIndirectCommand));
     });
-    auto& stats = chunk_batch_stats;
-    ++stats.batches;
-    stats.draws += count;
-    if (const auto now = std::chrono::steady_clock::now(); now - stats.window > std::chrono::seconds{10}) {
-        LOG_INFO(HW_GPU,
-                 "Chunk batches in the last 10 s: {} batches, {} draws ({:.0f} per batch); ended by "
-                 "a chunk outside the windows {} (indices {}, slots {}), by another draw {}, by "
-                 "other work {}",
-                 stats.batches, stats.draws,
-                 stats.batches ? static_cast<double>(stats.draws) / static_cast<double>(stats.batches) : 0.0,
-                 stats.ended_by_miss, stats.miss_index, fmt::join(stats.miss_slot, ","),
-                 stats.ended_by_draw, stats.batches - stats.ended_by_miss - stats.ended_by_draw);
-        stats = {.window = now};
-    }
-    batch.commands.clear();
-    batch.rows.clear();
-    gpu.TickWork();
 }
 
 GPUVAddr RasterizerVulkan::ReserveScratch(u64 bytes) {
@@ -1778,8 +1820,8 @@ void RasterizerVulkan::Nx2DumpRenderTarget(bool after_draw) {
 }
 
 void RasterizerVulkan::DrawIndirect() {
-    if (chunk_batch.active) {
-        FlushChunkBatch();
+    if (!chunk_batches.empty()) {
+        FlushChunkBatches();
     }
     VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::Draw};
     const auto& params = maxwell3d->draw_manager.indirect_state;
@@ -1851,8 +1893,8 @@ void RasterizerVulkan::DrawIndirect() {
 }
 
 void RasterizerVulkan::DrawTexture() {
-    if (chunk_batch.active) {
-        FlushChunkBatch();
+    if (!chunk_batches.empty()) {
+        FlushChunkBatches();
     }
 
     SCOPE_EXIT {
@@ -1901,8 +1943,8 @@ void RasterizerVulkan::DrawTexture() {
 }
 
 void RasterizerVulkan::Clear(u32 layer_count) {
-    if (chunk_batch.active) {
-        FlushChunkBatch();
+    if (!chunk_batches.empty()) {
+        FlushChunkBatches();
     }
     VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::Clear};
     if (Tegra::Engines::g_nx2_trace_draws_after_upscale > 0) {
@@ -2134,8 +2176,8 @@ void RasterizerVulkan::Clear(u32 layer_count) {
 }
 
 void RasterizerVulkan::DispatchCompute() {
-    if (chunk_batch.active) {
-        FlushChunkBatch();
+    if (!chunk_batches.empty()) {
+        FlushChunkBatches();
     }
     VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::Compute};
     if (frame_trace_state == 2) {
@@ -2225,8 +2267,8 @@ void RasterizerVulkan::ResetCounter(VideoCommon::QueryType type) {
 
 void RasterizerVulkan::Query(GPUVAddr gpu_addr, VideoCommon::QueryType type,
                              VideoCommon::QueryPropertiesFlags flags, u32 payload, u32 subreport) {
-    if (chunk_batch.active) {
-        FlushChunkBatch();
+    if (!chunk_batches.empty()) {
+        FlushChunkBatches();
     }
     query_cache.CounterReport(gpu_addr, type, flags, payload, subreport);
 }
@@ -2243,8 +2285,8 @@ void Vulkan::RasterizerVulkan::DisableGraphicsUniformBuffer(size_t stage, u32 in
 void RasterizerVulkan::FlushAll() {}
 
 void RasterizerVulkan::FlushRegion(DAddr addr, u64 size, VideoCommon::CacheType which) {
-    if (chunk_batch.active) {
-        FlushChunkBatch();
+    if (!chunk_batches.empty()) {
+        FlushChunkBatches();
     }
     if (addr == 0 || size == 0) {
         return;
@@ -2296,8 +2338,8 @@ VideoCore::RasterizerDownloadArea RasterizerVulkan::GetFlushArea(DAddr addr, u64
 }
 
 void RasterizerVulkan::InvalidateRegion(DAddr addr, u64 size, VideoCommon::CacheType which) {
-    if (chunk_batch.active) {
-        FlushChunkBatch();
+    if (!chunk_batches.empty()) {
+        FlushChunkBatches();
     }
     if (addr == 0 || size == 0) {
         return;
@@ -2356,8 +2398,8 @@ bool RasterizerVulkan::OnCPUWrite(DAddr addr, u64 size) {
 }
 
 void RasterizerVulkan::OnCacheInvalidation(DAddr addr, u64 size) {
-    if (chunk_batch.active) {
-        FlushChunkBatch();
+    if (!chunk_batches.empty()) {
+        FlushChunkBatches();
     }
     if (addr == 0 || size == 0) {
         return;
@@ -2387,15 +2429,16 @@ bool RasterizerVulkan::TryCacheInvalidation(DAddr addr, u64 size) {
 }
 
 void RasterizerVulkan::InvalidateGPUCache() {
-    if (chunk_batch.active) {
-        FlushChunkBatch();
+    if (!chunk_batches.empty()) {
+        FlushChunkBatches();
     }
     gpu.InvalidateGPUCache();
 }
 
 void RasterizerVulkan::UnmapMemory(DAddr addr, u64 size) {
-    if (chunk_batch.active) {
-        FlushChunkBatch();
+    chunk_window_cache.clear();
+    if (!chunk_batches.empty()) {
+        FlushChunkBatches();
     }
     {
         std::scoped_lock lock{texture_cache.mutex};
@@ -2409,8 +2452,9 @@ void RasterizerVulkan::UnmapMemory(DAddr addr, u64 size) {
 }
 
 void RasterizerVulkan::ModifyGPUMemory(size_t as_id, GPUVAddr addr, u64 size) {
-    if (chunk_batch.active) {
-        FlushChunkBatch();
+    chunk_window_cache.clear();
+    if (!chunk_batches.empty()) {
+        FlushChunkBatches();
     }
     {
         std::scoped_lock lock{texture_cache.mutex};
@@ -2420,44 +2464,44 @@ void RasterizerVulkan::ModifyGPUMemory(size_t as_id, GPUVAddr addr, u64 size) {
 }
 
 void RasterizerVulkan::SignalFence(std::function<void()>&& func) {
-    if (chunk_batch.active) {
-        FlushChunkBatch();
+    if (!chunk_batches.empty()) {
+        FlushChunkBatches();
     }
     fence_manager.SignalFence(std::move(func));
 }
 
 void RasterizerVulkan::SyncOperation(std::function<void()>&& func) {
-    if (chunk_batch.active) {
-        FlushChunkBatch();
+    if (!chunk_batches.empty()) {
+        FlushChunkBatches();
     }
     fence_manager.SyncOperation(std::move(func));
 }
 
 void RasterizerVulkan::SignalSyncPoint(u32 value) {
-    if (chunk_batch.active) {
-        FlushChunkBatch();
+    if (!chunk_batches.empty()) {
+        FlushChunkBatches();
     }
     fence_manager.SignalSyncPoint(value);
 }
 
 void RasterizerVulkan::SignalReference() {
-    if (chunk_batch.active) {
-        FlushChunkBatch();
+    if (!chunk_batches.empty()) {
+        FlushChunkBatches();
     }
     fence_manager.SignalReference();
 }
 
 void RasterizerVulkan::ReleaseFences(bool force) {
-    if (chunk_batch.active) {
-        FlushChunkBatch();
+    if (!chunk_batches.empty()) {
+        FlushChunkBatches();
     }
     fence_manager.WaitPendingFences(force);
 }
 
 void RasterizerVulkan::FlushAndInvalidateRegion(DAddr addr, u64 size,
                                                 VideoCommon::CacheType which) {
-    if (chunk_batch.active) {
-        FlushChunkBatch();
+    if (!chunk_batches.empty()) {
+        FlushChunkBatches();
     }
     if (Settings::IsGPULevelHigh()) {
         FlushRegion(addr, size, which);
@@ -2466,8 +2510,8 @@ void RasterizerVulkan::FlushAndInvalidateRegion(DAddr addr, u64 size,
 }
 
 void RasterizerVulkan::WaitForIdle() {
-    if (chunk_batch.active) {
-        FlushChunkBatch();
+    if (!chunk_batches.empty()) {
+        FlushChunkBatches();
     }
     // Everything but wait pixel operations. This intentionally includes FRAGMENT_SHADER_BIT because
     // fragment shaders can still write storage buffers.
@@ -2492,23 +2536,23 @@ void RasterizerVulkan::WaitForIdle() {
 }
 
 void RasterizerVulkan::FragmentBarrier() {
-    if (chunk_batch.active) {
-        FlushChunkBatch();
+    if (!chunk_batches.empty()) {
+        FlushChunkBatches();
     }
     // We already put barriers when a render pass finishes
     scheduler.RequestOutsideRenderPassOperationContext();
 }
 
 void RasterizerVulkan::TiledCacheBarrier() {
-    if (chunk_batch.active) {
-        FlushChunkBatch();
+    if (!chunk_batches.empty()) {
+        FlushChunkBatches();
     }
     // TODO: Implementing tiled barriers requires rewriting a good chunk of the Vulkan backend
 }
 
 void RasterizerVulkan::FlushCommands() {
-    if (chunk_batch.active) {
-        FlushChunkBatch();
+    if (!chunk_batches.empty()) {
+        FlushChunkBatches();
     }
     if (draw_counter == 0) {
         return;
@@ -2518,8 +2562,8 @@ void RasterizerVulkan::FlushCommands() {
 }
 
 void RasterizerVulkan::TickFrame() {
-    if (chunk_batch.active) {
-        FlushChunkBatch();
+    if (!chunk_batches.empty()) {
+        FlushChunkBatches();
     }
     draw_counter = 0;
     ++frame_counter;
@@ -2620,8 +2664,8 @@ Tegra::Engines::AccelerateDMAInterface& RasterizerVulkan::AccessAccelerateDMA() 
 
 void RasterizerVulkan::AccelerateInlineToMemory(GPUVAddr address, size_t copy_size,
                                                 std::span<const u8> memory) {
-    if (chunk_batch.active) {
-        FlushChunkBatch();
+    if (!chunk_batches.empty()) {
+        FlushChunkBatches();
     }
     auto cpu_addr = gpu_memory->GpuToCpuAddress(address);
     if (gpu_memory->UsesNativeTiling()) {
