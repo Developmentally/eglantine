@@ -83,10 +83,18 @@ void DrawTablePass(Environment& env, IR::Program& program) {
     if (table.forward_draw_id) {
         // Vertex program of a batched pipeline: the draw's row (its first instance) goes out as a
         // varying for the patched stage, as an integer-valued float (exact below 2^24) rather than
-        // its bit pattern, which would be a denormal. Stored at the entry; outputs have no
-        // ordering.
+        // its bit pattern, which would be a denormal. Stored right after the prologue, which
+        // initializes every output (a store before it would be overwritten); the program itself
+        // never writes this attribute.
         IR::Block* const entry{program.blocks.front()};
-        IR::IREmitter ir{*entry, entry->begin()};
+        auto insertion{entry->begin()};
+        for (auto it{entry->begin()}; it != entry->end(); ++it) {
+            if (it->GetOpcode() == IR::Opcode::Prologue) {
+                insertion = std::next(it);
+                break;
+            }
+        }
+        IR::IREmitter ir{*entry, insertion};
         const IR::U32 draw_id{ir.GetAttributeU32(IR::Attribute::BaseInstance)};
         ir.SetAttribute(DrawIdAttribute(table.draw_id_attribute),
                         IR::F32{ir.ConvertUToF(32, 32, draw_id)}, ir.Imm32(0));
