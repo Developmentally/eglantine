@@ -30,7 +30,7 @@ void EnsureNx2MeshScratch(Core::System& system) {
     static const bool enabled = [] {
         for (const char* name : {"EDEN_NX2_MESH_EMU", "EDEN_NX2_CHUNK_BATCH"}) {
             const char* value = std::getenv(name);
-            if (value != nullptr && value[0] >= '1' && value[0] <= '9') {
+            if (value != nullptr && value[0] == '1') {
                 return true;
             }
         }

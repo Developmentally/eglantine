@@ -211,18 +211,10 @@ private:
             s32 base_vertex;
             std::array<GPUVAddr, Tegra::Engines::Maxwell3D::Regs::NumVertexArrays> vb_address{};
             std::array<u32, Tegra::Engines::Maxwell3D::Regs::NumVertexArrays> vb_size{};
-            /// EDEN_NX2_CHUNK_BATCH_CBUF_HASH: constant buffer contents of the vertex and the
-            /// patched stage at draw time.
-            std::array<std::array<u64, Tegra::Engines::Maxwell3D::Regs::MaxConstBuffers>, 2> cbuf_hash{};
         };
         std::vector<Draw> draws;
         GraphicsPipeline* base_pipeline{};  ///< the game's pipeline for these draws
         GraphicsPipeline* pipeline{};       ///< its patched variant
-        // EDEN_NX2_CHUNK_BATCH_VERIFY: the state at Begin, compared at the flush.
-        std::unique_ptr<std::array<u32, Tegra::Engines::Maxwell3D::Regs::NUM_REGS>> regs_snapshot;
-        std::array<u32, 6> draw_snapshot{};
-        std::array<u64, Tegra::Engines::Maxwell3D::Regs::MaxShaderStage * Tegra::Engines::Maxwell3D::Regs::MaxConstBuffers> cbuf_snapshot{};
-        Tegra::Engines::Maxwell3D::DirtyState::Flags dirty_snapshot;
     };
     /// Batches open at once (one per patched constant buffer and slot set in practice); the
     /// geometry shader only appends to each chunk's own record, so the draws of different

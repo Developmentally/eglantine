@@ -302,14 +302,13 @@ bool RasterizerVulkan::ResetIndirectRecordsOnCpu(bool is_indexed) {
 }
 
 namespace {
-// EDEN_NX2_CHUNK_BATCH: 0 off, 1 on, 2 on with every window exactly the range of its first draw
-// (one draw per batch, bindings identical to the game's: isolates the batched draw path).
-u32 ChunkBatchingMode() {
-    static const u32 mode = [] {
+// EDEN_NX2_CHUNK_BATCH=1: draw runs of terrain chunk draws under one pipeline configuration.
+bool ChunkBatchingEnabled() {
+    static const bool enabled = [] {
         const char* value = std::getenv("EDEN_NX2_CHUNK_BATCH");
-        return value != nullptr && value[0] >= '1' && value[0] <= '9' ? u32(value[0] - '0') : 0U;
+        return value != nullptr && value[0] == '1';
     }();
-    return mode;
+    return enabled;
 }
 
 // A window of memory around `pointer` that holds [pointer, pointer + need), as large as 32 MiB so
@@ -317,10 +316,6 @@ u32 ChunkBatchingMode() {
 // contiguous: the host buffer bound over it is one allocation.
 std::optional<std::pair<GPUVAddr, u64>> MappedWindow(const Tegra::MemoryManager& gpu_memory,
                                                      GPUVAddr pointer, u64 need) {
-    if (ChunkBatchingMode() == 2) {
-        return gpu_memory.IsContinuousRange(pointer, need) ? std::optional{std::pair{pointer, need}}
-                                                           : std::nullopt;
-    }
     constexpr u64 Granule = 0x10000;
     constexpr u64 MaxWindow = u64{32} << 20;
     constexpr u64 MaxBefore = u64{8} << 20;
@@ -454,7 +449,7 @@ std::optional<RasterizerVulkan::ChunkPattern> RasterizerVulkan::MatchChunkPatter
 }
 
 bool RasterizerVulkan::TryBatchChunkDraw(bool is_indexed, u32 instance_count) {
-    if (ChunkBatchingMode() == 0) {
+    if (!ChunkBatchingEnabled()) {
         return false;
     }
     maxwell3d->record_writes_since_draw = true;
@@ -474,31 +469,14 @@ bool RasterizerVulkan::TryBatchChunkDraw(bool is_indexed, u32 instance_count) {
             }
         }
     }
-    // EDEN_NX2_CHUNK_BATCH_OPEN: batches open at once (experiments).
-    static const size_t max_open = [] {
-        const char* value = std::getenv("EDEN_NX2_CHUNK_BATCH_OPEN");
-        const size_t n = value ? static_cast<size_t>(std::strtoul(value, nullptr, 10)) : MaxOpenChunkBatches;
-        return std::clamp<size_t>(n, 1, MaxOpenChunkBatches);
-    }();
-    if (!chunk_batches.empty() && (!pattern || chunk_batches.size() >= max_open)) {
+    if (!chunk_batches.empty() && (!pattern || chunk_batches.size() >= MaxOpenChunkBatches)) {
         ++(pattern ? chunk_batch_stats.ended_by_miss : chunk_batch_stats.ended_by_draw);
         FlushChunkBatches();
     }
-    if (!pattern || !BeginChunkBatch(*pattern)) {
-        return false;
-    }
-    // EDEN_NX2_CHUNK_BATCH_EAGER=1: draw each batch as soon as it opens (experiments).
-    static const bool eager = std::getenv("EDEN_NX2_CHUNK_BATCH_EAGER") != nullptr;
-    if (eager) {
-        FlushChunkBatches();
-    }
-    return true;
+    return pattern && BeginChunkBatch(*pattern);
 }
 
 std::optional<std::pair<GPUVAddr, u64>> RasterizerVulkan::ChunkWindow(GPUVAddr pointer, u64 need) {
-    if (ChunkBatchingMode() == 2) {
-        return MappedWindow(*gpu_memory, pointer, need);
-    }
     // Finding a window walks page tables over tens of MiB; remember it per 64 KiB of pointers.
     const GPUVAddr key = Common::AlignDown(pointer, 0x10000);
     if (const auto it = chunk_window_cache.find(key); it != chunk_window_cache.end()) {
@@ -526,11 +504,6 @@ bool RasterizerVulkan::BeginChunkBatch(const ChunkPattern& pattern) {
     GraphicsPipeline* const base = pipeline_cache.CurrentGraphicsPipeline();
     if (!base || base->IsMeshPipeline()) {
         return false;
-    }
-    static u32 logged_bases{};
-    if (logged_bases < 16) {
-        ++logged_bases;
-        LOG_INFO(HW_GPU, "Chunk batch base pipeline {}", fmt::ptr(base));
     }
     const auto& regs = maxwell3d->regs;
     const GPUVAddr vertex_program =
@@ -661,23 +634,6 @@ bool RasterizerVulkan::BeginChunkBatch(const ChunkPattern& pattern) {
                  fmt::join(std::span{batch.span_size.data(), pattern.num_slots}, ","), batch.index_format,
                  batch.stream_mask);
     }
-    // EDEN_NX2_CHUNK_BATCH_VERIFY=1: remember the state the batch opened with, to compare at the
-    // flush (diagnostic).
-    static const bool verify = std::getenv("EDEN_NX2_CHUNK_BATCH_VERIFY") != nullptr;
-    if (verify) {
-        const auto& draw_state = maxwell3d->draw_manager.draw_state;
-        batch.regs_snapshot = std::make_unique<std::array<u32, Maxwell::NUM_REGS>>(regs.reg_array);
-        batch.draw_snapshot = {static_cast<u32>(draw_state.topology), draw_state.base_index, draw_state.base_instance,
-                               draw_state.instance_count, static_cast<u32>(draw_state.draw_mode),
-                               static_cast<u32>(draw_state.inline_index_draw_indexes.size())};
-        for (size_t st = 0; st < Maxwell::MaxShaderStage; ++st) {
-            for (u32 b = 0; b < Maxwell::MaxConstBuffers; ++b) {
-                const auto& c = maxwell3d->state.shader_stages[st].const_buffers[b];
-                batch.cbuf_snapshot[st * Maxwell::MaxConstBuffers + b] = c.enabled ? c.address ^ (u64{c.size} << 48) : 0;
-            }
-        }
-        batch.dirty_snapshot = maxwell3d->dirty.flags;
-    }
     chunk_batches.push_back(std::move(batch));
     // Any other register write flushes the batches before it changes the state they ran with.
     auto& guard = maxwell3d->batched_draw_guard;
@@ -698,14 +654,7 @@ bool RasterizerVulkan::ExtendChunkBatch(ChunkBatch& batch, const ChunkPattern& p
             return false;
         }
     }
-    // EDEN_NX2_CHUNK_BATCH_MAX_DRAWS: cap for experiments (1 = every draw alone, so only the
-    // table's first row is ever read).
-    static const u32 max_draws = [] {
-        const char* value = std::getenv("EDEN_NX2_CHUNK_BATCH_MAX_DRAWS");
-        const u32 n = value ? static_cast<u32>(std::strtoul(value, nullptr, 10)) : ChunkBatch::MaxDraws;
-        return std::clamp<u32>(n, 1, ChunkBatch::MaxDraws);
-    }();
-    if (batch.draws.size() >= max_draws) {
+    if (batch.draws.size() >= ChunkBatch::MaxDraws) {
         return false;
     }
     const auto& regs = maxwell3d->regs;
@@ -754,35 +703,6 @@ bool RasterizerVulkan::ExtendChunkBatch(ChunkBatch& batch, const ChunkPattern& p
         deltas[k] = static_cast<u32>(pointer - batch.span_base[k]);
     }
     batch.rows.insert(batch.rows.end(), deltas.begin(), deltas.end());
-    // Diagnostic: the contents of the constant buffers the stages read, hashed, to see whether
-    // the game rewrites them between chunk draws through memory the emulator does not watch.
-    static const bool hash_cbufs = std::getenv("EDEN_NX2_CHUNK_BATCH_CBUF_HASH") != nullptr;
-    if (hash_cbufs) {
-        for (size_t st : {size_t{0}, batch.stage}) {
-            for (u32 b = 0; b < Maxwell::MaxConstBuffers; ++b) {
-                const auto& c = maxwell3d->state.shader_stages[st].const_buffers[b];
-                if (!c.enabled || c.size == 0 || c.size > 0x10000) {
-                    continue;
-                }
-                std::vector<u8> bytes(c.size);
-                gpu_memory->ReadBlockUnsafe(c.address, bytes.data(), c.size);
-                if (c.address == batch.cbuf_address) {
-                    // The patched slots differ by construction; everything else should not.
-                    for (u32 k = 0; k < batch.table.num_slots; ++k) {
-                        const u32 at = batch.table.slots[k].cbuf_offset;
-                        if (at + 16 <= bytes.size()) {
-                            std::fill_n(bytes.begin() + at, 16, u8{});
-                        }
-                    }
-                }
-                u64 h = 1469598103934665603ULL;
-                for (const u8 byte : bytes) {
-                    h = (h ^ byte) * 1099511628211ULL;
-                }
-                draw.cbuf_hash[st == 0 ? 0 : 1][b] = h;
-            }
-        }
-    }
     batch.draws.push_back(draw);
     return true;
 }
@@ -825,72 +745,13 @@ void RasterizerVulkan::DrawChunkBatch(ChunkBatch& batch) {
     if (count == 0) {
         return;
     }
-    if (batch.regs_snapshot) {
-        static u32 verified{};
-        if (verified++ < 12) {
-            const auto& regs = maxwell3d->regs;
-            const auto& draw_state = maxwell3d->draw_manager.draw_state;
-            std::string diff;
-            u32 differing = 0;
-            for (u32 i = 0; i < Maxwell::NUM_REGS; ++i) {
-                if ((*batch.regs_snapshot)[i] != regs.reg_array[i]) {
-                    if (differing++ < 12) {
-                        diff += fmt::format(" r{:#x}:{:#x}->{:#x}", i, (*batch.regs_snapshot)[i], regs.reg_array[i]);
-                    }
-                }
-            }
-            std::string cbufs;
-            for (size_t st = 0; st < Maxwell::MaxShaderStage; ++st) {
-                for (u32 b = 0; b < Maxwell::MaxConstBuffers; ++b) {
-                    const auto& c = maxwell3d->state.shader_stages[st].const_buffers[b];
-                    const u64 now = c.enabled ? c.address ^ (u64{c.size} << 48) : 0;
-                    if (now != batch.cbuf_snapshot[st * Maxwell::MaxConstBuffers + b]) {
-                        cbufs += fmt::format(" s{}b{}", st, b);
-                    }
-                }
-            }
-            const std::array<u32, 6> now{static_cast<u32>(draw_state.topology), draw_state.base_index,
-                                         draw_state.base_instance, draw_state.instance_count,
-                                         static_cast<u32>(draw_state.draw_mode),
-                                         static_cast<u32>(draw_state.inline_index_draw_indexes.size())};
-            u32 dirty_new = 0;
-            for (size_t f = 0; f < batch.dirty_snapshot.size(); ++f) {
-                dirty_new += !batch.dirty_snapshot[f] && maxwell3d->dirty.flags[f];
-            }
-            LOG_INFO(HW_GPU,
-                     "Chunk batch verify ({} draws): {} registers differ{}; cbuf bindings changed:{}; draw state "
-                     "topology/base_index/base_instance/instances/mode/inline {} -> {}; dirty flags newly set {}",
-                     count, differing, diff, cbufs.empty() ? " none" : cbufs, fmt::join(batch.draw_snapshot, "/"),
-                     fmt::join(now, "/"), dirty_new);
-        }
-    }
-    static u32 dumped{};
-    if (dumped < 4) {
-        ++dumped;
-        const auto& d = batch.draws.front();
-        LOG_INFO(HW_GPU,
-                 "Chunk batch of {} draws: scratch {:#x} table +{:#x}; spans {:#x}+{:#x}, {:#x}+{:#x}; row 0 deltas "
-                 "{:#x},{:#x}; draw 0 indices {:#x} first {} count {} base vertex {} vb0 {:#x}+{:#x}; last row deltas "
-                 "{:#x},{:#x}",
-                 count, batch.scratch, batch.table_offset, batch.span_base[0], batch.span_size[0], batch.span_base[1],
-                 batch.span_size[1], batch.rows[0], batch.rows[1], d.index_address, d.first_index, d.index_count,
-                 d.base_vertex, d.vb_address[0], d.vb_size[0], batch.rows[(count - 1) * ChunkBatch::MaxSlots],
-                 batch.rows[(count - 1) * ChunkBatch::MaxSlots + 1]);
-    }
     // The copy and the table go through guest memory like any CPU-written buffer, then the range
     // is obtained with synchronization so the upload is recorded before the draws.
     const u32 copy_size = static_cast<u32>(batch.cbuf_copy.size());
     const u32 rows_bytes = count * batch.table.stride;
-    // Under SLOTS_PER_DRAW the pointers in the copy are each chunk's own: the table must add 0.
-    std::vector<u32> rows_upload;
-    const std::vector<u32>* rows = &batch.rows;
-    if (std::getenv("EDEN_NX2_CHUNK_BATCH_SLOTS_PER_DRAW") != nullptr) {
-        rows_upload.assign(batch.rows.size(), 0);
-        rows = &rows_upload;
-    }
     AccelerateInlineToMemory(batch.scratch, copy_size, batch.cbuf_copy);
     AccelerateInlineToMemory(batch.scratch + batch.table_offset, rows_bytes,
-                             std::span{reinterpret_cast<const u8*>(rows->data()), rows_bytes});
+                             std::span{reinterpret_cast<const u8*>(batch.rows.data()), rows_bytes});
     gpu_memory->FlushCaching();
     // Configure once with the copy in the bank; the bank the game set is restored afterwards. The
     // vertex and index buffers are bound per draw below and marked dirty so the next draw re-binds
@@ -943,11 +804,6 @@ void RasterizerVulkan::DrawChunkBatch(ChunkBatch& batch) {
             VideoCommon::ObtainBufferOperation::DoNothing);
     }
     scheduler.RequestRenderpass(texture_cache.GetFramebuffer());
-    // EDEN_NX2_CHUNK_BATCH_ROW0=1: every draw reads row 0 (experiments: wrong deltas, but tells a
-    // broken row path from a broken multi-draw path).
-    static const bool row0 = std::getenv("EDEN_NX2_CHUNK_BATCH_ROW0") != nullptr;
-    static u32 logged_chunk_draws{};
-    static u32 hash_cbufs_words_logged{};
     for (u32 index = 0; index < count; ++index) {
         const ChunkBatch::Draw& draw = batch.draws[index];
         for (u32 i = 0; i < Maxwell::NumVertexArrays; ++i) {
@@ -966,107 +822,8 @@ void RasterizerVulkan::DrawChunkBatch(ChunkBatch& batch) {
             VideoCommon::ObtainBufferOperation::DoNothing);
         buffer_cache.runtime.BindIndexBuffer(topology, index_format, draw.first_index, draw.index_count,
                                              index_buffer->Handle(), index_offset, index_bytes);
-        if (logged_chunk_draws < 24) {
-            ++logged_chunk_draws;
-            std::string changed;
-            for (size_t which = 0; which < 2; ++which) {
-                for (u32 b = 0; b < Maxwell::MaxConstBuffers; ++b) {
-                    const u64 h = draw.cbuf_hash[which][b];
-                    if (h != 0 && h != batch.draws.front().cbuf_hash[which][b]) {
-                        changed += fmt::format(" {}:b{}", which == 0 ? "vs" : "gs", b);
-                    }
-                }
-            }
-            if (!changed.empty() && hash_cbufs_words_logged < 6) {
-                ++hash_cbufs_words_logged;
-                // Which words of the patched bank differ between draw 0 and this draw, now.
-                const auto& first = batch.draws.front();
-                std::vector<u8> a(batch.cbuf_size), b(batch.cbuf_size);
-                gpu_memory->ReadBlockUnsafe(batch.cbuf_address, b.data(), batch.cbuf_size);
-                std::string words;
-                u32 n = 0;
-                for (u32 w = 0; w + 4 <= batch.cbuf_size; w += 4) {
-                    u32 va, vb;
-                    std::memcpy(&va, batch.cbuf_copy.data() + w, 4);
-                    std::memcpy(&vb, b.data() + w, 4);
-                    if (va != vb && n++ < 16) {
-                        words += fmt::format(" {:#x}:{:#x}->{:#x}", w, va, vb);
-                    }
-                }
-                (void)first;
-                (void)a;
-                LOG_INFO(HW_GPU, "Chunk draw {}: {} words of the patched bank differ from the batch's copy:{}", index,
-                         n, words);
-            }
-            LOG_INFO(HW_GPU,
-                     "Chunk draw {}/{}: indices {:#x} (+{:#x} in {}) count {} vb0 {:#x}+{:#x}; row {}; cbufs differing "
-                     "from draw 0:{}",
-                     index, count, draw.index_address, index_offset, fmt::ptr(index_buffer->Handle()),
-                     draw.index_count, draw.vb_address[0], draw.vb_size[0], batch.rows[index * ChunkBatch::MaxSlots],
-                     changed.empty() ? " none" : changed);
-        }
-        // EDEN_NX2_CHUNK_BATCH_RECONFIGURE=1: configure the patched pipeline again before every
-        // draw after the first (experiments: tells whether what the later draws lack is in
-        // Configure at all).
-        static const bool reconfigure = std::getenv("EDEN_NX2_CHUNK_BATCH_RECONFIGURE") != nullptr;
-        // EDEN_NX2_CHUNK_BATCH_SLOTS_PER_DRAW=1 (with RECONFIGURE and ROW0): rewrite the copy's
-        // patched slots with this chunk's own pointers before each Configure, so every draw sees
-        // what a one-draw batch would, without the table (experiments).
-        static const bool slots_per_draw = std::getenv("EDEN_NX2_CHUNK_BATCH_SLOTS_PER_DRAW") != nullptr;
-        // EDEN_NX2_CHUNK_BATCH_TABLE_PER_DRAW=1 (with RECONFIGURE and ROW0): point the copy's table
-        // slot at this draw's row, so row 0 as read by the program is this chunk's row.
-        static const bool table_per_draw = std::getenv("EDEN_NX2_CHUNK_BATCH_TABLE_PER_DRAW") != nullptr;
-        if ((slots_per_draw || table_per_draw) && (reconfigure || index == 0)) {
-            if (slots_per_draw) {
-                for (u32 k = 0; k < batch.table.num_slots; ++k) {
-                    const u32 at = batch.table.slots[k].cbuf_offset;
-                    const u64 pointer = batch.span_base[k] + batch.rows[index * ChunkBatch::MaxSlots + k];
-                    std::memcpy(batch.cbuf_copy.data() + at, &pointer, sizeof(pointer));
-                    const u64 size = batch.span_base[k] + batch.span_size[k] - pointer;
-                    std::memcpy(batch.cbuf_copy.data() + at + 8, &size, sizeof(size));
-                }
-            } else {
-                const u32 at = batch.table.table_slot.cbuf_offset;
-                const u64 pointer = batch.scratch + batch.table_offset + u64{index} * batch.table.stride;
-                std::memcpy(batch.cbuf_copy.data() + at, &pointer, sizeof(pointer));
-                const u64 size = u64{ChunkBatch::MaxDraws - index} * batch.table.stride;
-                std::memcpy(batch.cbuf_copy.data() + at + 8, &size, sizeof(size));
-            }
-            AccelerateInlineToMemory(batch.scratch, copy_size, batch.cbuf_copy);
-            gpu_memory->FlushCaching();
-            [[maybe_unused]] const auto re = buffer_cache.ObtainBuffer(
-                batch.scratch, copy_size, VideoCommon::ObtainBufferSynchronize::FullSynchronize,
-                VideoCommon::ObtainBufferOperation::DoNothing);
-            if (index == 0) {
-                maxwell3d->dirty.flags.set();
-                if (!batch.pipeline->Configure(true)) {
-                    continue;
-                }
-                UpdateDynamicStates();
-                scheduler.RequestRenderpass(texture_cache.GetFramebuffer());
-            }
-        }
-        if (reconfigure && index != 0) {
-            maxwell3d->dirty.flags.set();
-            if (!batch.pipeline->Configure(true)) {
-                continue;
-            }
-            UpdateDynamicStates();
-            scheduler.RequestRenderpass(texture_cache.GetFramebuffer());
-            for (u32 i = 0; i < Maxwell::NumVertexArrays; ++i) {
-                if ((batch.stream_mask >> i) & 1) {
-                    const auto [vb, vb_offset] = buffer_cache.ObtainBuffer(
-                        draw.vb_address[i], draw.vb_size[i], VideoCommon::ObtainBufferSynchronize::NoSynchronize,
-                        VideoCommon::ObtainBufferOperation::DoNothing);
-                    buffer_cache.runtime.BindVertexBuffer(i, vb->Handle(), vb_offset, draw.vb_size[i],
-                                                          regs.vertex_streams[i].stride);
-                }
-            }
-            buffer_cache.runtime.BindIndexBuffer(topology, index_format, draw.first_index, draw.index_count,
-                                                 index_buffer->Handle(), index_offset, index_bytes);
-        }
-        scheduler.Record([draw, row = row0 ? 0U : index](vk::CommandBuffer cmdbuf) {
-            cmdbuf.DrawIndexed(draw.index_count, 1, draw.first_index, static_cast<u32>(draw.base_vertex), row);
+        scheduler.Record([draw, index](vk::CommandBuffer cmdbuf) {
+            cmdbuf.DrawIndexed(draw.index_count, 1, draw.first_index, static_cast<u32>(draw.base_vertex), index);
         });
     }
 }
@@ -1478,7 +1235,7 @@ void RasterizerVulkan::RecordDrawStats(u64 draws, u64 vertices, bool indirect) {
 void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
     VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::Draw};
     SCOPE_EXIT {
-        if (ChunkBatchingMode() != 0) {
+        if (ChunkBatchingEnabled()) {
             maxwell3d->ClearWritesSinceDraw();
         }
     };
