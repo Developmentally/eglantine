@@ -107,6 +107,16 @@ void GpuSplit::MaybeStart(Core::System& system_) {
         return;
     }
     if (active || !allowed) {
+        // GPU Accuracy defaults to High in some frontends. Tell users why the
+        // front/back split never starts without silently changing accuracy.
+        if (!active && !allowed && Settings::IsGPULevelHigh() &&
+            Settings::values.renderer_backend.GetValue() == Settings::RendererBackend::Vulkan) {
+            static bool warned_high_accuracy = false;
+            if (!warned_high_accuracy) {
+                LOG_INFO(HW_GPU, "GPU thread split disabled by High GPU accuracy");
+                warned_high_accuracy = true;
+            }
+        }
         return;
     }
     system = &system_;
