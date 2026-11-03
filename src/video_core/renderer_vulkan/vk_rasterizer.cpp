@@ -766,6 +766,15 @@ bool RasterizerVulkan::ExtendChunkBatch(ChunkBatch& batch, const ChunkPattern& p
                 }
                 std::vector<u8> bytes(c.size);
                 gpu_memory->ReadBlockUnsafe(c.address, bytes.data(), c.size);
+                if (c.address == batch.cbuf_address) {
+                    // The patched slots differ by construction; everything else should not.
+                    for (u32 k = 0; k < batch.table.num_slots; ++k) {
+                        const u32 at = batch.table.slots[k].cbuf_offset;
+                        if (at + 16 <= bytes.size()) {
+                            std::fill_n(bytes.begin() + at, 16, u8{});
+                        }
+                    }
+                }
                 u64 h = 1469598103934665603ULL;
                 for (const u8 byte : bytes) {
                     h = (h ^ byte) * 1099511628211ULL;
@@ -931,6 +940,7 @@ void RasterizerVulkan::DrawChunkBatch(ChunkBatch& batch) {
     // broken row path from a broken multi-draw path).
     static const bool row0 = std::getenv("EDEN_NX2_CHUNK_BATCH_ROW0") != nullptr;
     static u32 logged_chunk_draws{};
+    static u32 hash_cbufs_words_logged{};
     for (u32 index = 0; index < count; ++index) {
         const ChunkBatch::Draw& draw = batch.draws[index];
         for (u32 i = 0; i < Maxwell::NumVertexArrays; ++i) {
@@ -959,6 +969,27 @@ void RasterizerVulkan::DrawChunkBatch(ChunkBatch& batch) {
                         changed += fmt::format(" {}:b{}", which == 0 ? "vs" : "gs", b);
                     }
                 }
+            }
+            if (!changed.empty() && hash_cbufs_words_logged < 6) {
+                ++hash_cbufs_words_logged;
+                // Which words of the patched bank differ between draw 0 and this draw, now.
+                const auto& first = batch.draws.front();
+                std::vector<u8> a(batch.cbuf_size), b(batch.cbuf_size);
+                gpu_memory->ReadBlockUnsafe(batch.cbuf_address, b.data(), batch.cbuf_size);
+                std::string words;
+                u32 n = 0;
+                for (u32 w = 0; w + 4 <= batch.cbuf_size; w += 4) {
+                    u32 va, vb;
+                    std::memcpy(&va, batch.cbuf_copy.data() + w, 4);
+                    std::memcpy(&vb, b.data() + w, 4);
+                    if (va != vb && n++ < 16) {
+                        words += fmt::format(" {:#x}:{:#x}->{:#x}", w, va, vb);
+                    }
+                }
+                (void)first;
+                (void)a;
+                LOG_INFO(HW_GPU, "Chunk draw {}: {} words of the patched bank differ from the batch's copy:{}", index,
+                         n, words);
             }
             LOG_INFO(HW_GPU,
                      "Chunk draw {}/{}: indices {:#x} (+{:#x} in {}) count {} vb0 {:#x}+{:#x}; row {}; cbufs differing "
