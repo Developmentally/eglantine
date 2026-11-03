@@ -1013,12 +1013,23 @@ void RasterizerVulkan::DrawChunkBatch(ChunkBatch& batch) {
         // patched slots with this chunk's own pointers before each Configure, so every draw sees
         // what a one-draw batch would, without the table (experiments).
         static const bool slots_per_draw = std::getenv("EDEN_NX2_CHUNK_BATCH_SLOTS_PER_DRAW") != nullptr;
-        if (slots_per_draw && (reconfigure || index == 0)) {
-            for (u32 k = 0; k < batch.table.num_slots; ++k) {
-                const u32 at = batch.table.slots[k].cbuf_offset;
-                const u64 pointer = batch.span_base[k] + batch.rows[index * ChunkBatch::MaxSlots + k];
+        // EDEN_NX2_CHUNK_BATCH_TABLE_PER_DRAW=1 (with RECONFIGURE and ROW0): point the copy's table
+        // slot at this draw's row, so row 0 as read by the program is this chunk's row.
+        static const bool table_per_draw = std::getenv("EDEN_NX2_CHUNK_BATCH_TABLE_PER_DRAW") != nullptr;
+        if ((slots_per_draw || table_per_draw) && (reconfigure || index == 0)) {
+            if (slots_per_draw) {
+                for (u32 k = 0; k < batch.table.num_slots; ++k) {
+                    const u32 at = batch.table.slots[k].cbuf_offset;
+                    const u64 pointer = batch.span_base[k] + batch.rows[index * ChunkBatch::MaxSlots + k];
+                    std::memcpy(batch.cbuf_copy.data() + at, &pointer, sizeof(pointer));
+                    const u64 size = batch.span_base[k] + batch.span_size[k] - pointer;
+                    std::memcpy(batch.cbuf_copy.data() + at + 8, &size, sizeof(size));
+                }
+            } else {
+                const u32 at = batch.table.table_slot.cbuf_offset;
+                const u64 pointer = batch.scratch + batch.table_offset + u64{index} * batch.table.stride;
                 std::memcpy(batch.cbuf_copy.data() + at, &pointer, sizeof(pointer));
-                const u64 size = batch.span_base[k] + batch.span_size[k] - pointer;
+                const u64 size = u64{ChunkBatch::MaxDraws - index} * batch.table.stride;
                 std::memcpy(batch.cbuf_copy.data() + at + 8, &size, sizeof(size));
             }
             AccelerateInlineToMemory(batch.scratch, copy_size, batch.cbuf_copy);
