@@ -881,9 +881,16 @@ void RasterizerVulkan::DrawChunkBatch(ChunkBatch& batch) {
     // is obtained with synchronization so the upload is recorded before the draws.
     const u32 copy_size = static_cast<u32>(batch.cbuf_copy.size());
     const u32 rows_bytes = count * batch.table.stride;
+    // Under SLOTS_PER_DRAW the pointers in the copy are each chunk's own: the table must add 0.
+    std::vector<u32> rows_upload;
+    const std::vector<u32>* rows = &batch.rows;
+    if (std::getenv("EDEN_NX2_CHUNK_BATCH_SLOTS_PER_DRAW") != nullptr) {
+        rows_upload.assign(batch.rows.size(), 0);
+        rows = &rows_upload;
+    }
     AccelerateInlineToMemory(batch.scratch, copy_size, batch.cbuf_copy);
     AccelerateInlineToMemory(batch.scratch + batch.table_offset, rows_bytes,
-                             std::span{reinterpret_cast<const u8*>(batch.rows.data()), rows_bytes});
+                             std::span{reinterpret_cast<const u8*>(rows->data()), rows_bytes});
     gpu_memory->FlushCaching();
     // Configure once with the copy in the bank; the bank the game set is restored afterwards. The
     // vertex and index buffers are bound per draw below and marked dirty so the next draw re-binds
@@ -1002,6 +1009,32 @@ void RasterizerVulkan::DrawChunkBatch(ChunkBatch& batch) {
         // draw after the first (experiments: tells whether what the later draws lack is in
         // Configure at all).
         static const bool reconfigure = std::getenv("EDEN_NX2_CHUNK_BATCH_RECONFIGURE") != nullptr;
+        // EDEN_NX2_CHUNK_BATCH_SLOTS_PER_DRAW=1 (with RECONFIGURE and ROW0): rewrite the copy's
+        // patched slots with this chunk's own pointers before each Configure, so every draw sees
+        // what a one-draw batch would, without the table (experiments).
+        static const bool slots_per_draw = std::getenv("EDEN_NX2_CHUNK_BATCH_SLOTS_PER_DRAW") != nullptr;
+        if (slots_per_draw && (reconfigure || index == 0)) {
+            for (u32 k = 0; k < batch.table.num_slots; ++k) {
+                const u32 at = batch.table.slots[k].cbuf_offset;
+                const u64 pointer = batch.span_base[k] + batch.rows[index * ChunkBatch::MaxSlots + k];
+                std::memcpy(batch.cbuf_copy.data() + at, &pointer, sizeof(pointer));
+                const u64 size = batch.span_base[k] + batch.span_size[k] - pointer;
+                std::memcpy(batch.cbuf_copy.data() + at + 8, &size, sizeof(size));
+            }
+            AccelerateInlineToMemory(batch.scratch, copy_size, batch.cbuf_copy);
+            gpu_memory->FlushCaching();
+            [[maybe_unused]] const auto re = buffer_cache.ObtainBuffer(
+                batch.scratch, copy_size, VideoCommon::ObtainBufferSynchronize::FullSynchronize,
+                VideoCommon::ObtainBufferOperation::DoNothing);
+            if (index == 0) {
+                maxwell3d->dirty.flags.set();
+                if (!batch.pipeline->Configure(true)) {
+                    continue;
+                }
+                UpdateDynamicStates();
+                scheduler.RequestRenderpass(texture_cache.GetFramebuffer());
+            }
+        }
         if (reconfigure && index != 0) {
             maxwell3d->dirty.flags.set();
             if (!batch.pipeline->Configure(true)) {
