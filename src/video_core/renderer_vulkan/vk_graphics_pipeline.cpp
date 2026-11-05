@@ -348,8 +348,8 @@ GraphicsPipeline::GraphicsPipeline(
             }
             return;
         }
-        // The modules are only needed to create the pipeline. Kept, the driver holds every
-        // pipeline's SPIR-V for the whole session (thousands of pipelines from the disk cache).
+        // Release shader-module objects after pipeline creation; driver memory savings are
+        // implementation-dependent.
         spv_modules = {};
         if (pipeline_statistics) {
             pipeline_statistics->Collect(device, *pipeline);
