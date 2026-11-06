@@ -94,30 +94,53 @@ TEST_CASE("GPUDirtyMemoryManager: empty gather reports nothing", "[gpu_dirty]") 
 }
 
 // ============================================================================
-// Criterion 2 chain fixture (eglantine test 3): the second same-page CPU write
-// must reach the consumer after revalidation through the REAL deferred path.
+// Criterion 2 chain fixture (eglantine test 3): does the second same-page CPU
+// write - the one the rasterizer-write gate's shortcut skips - still reach the
+// buffer-cache consumer through the REAL deferred Collect/Gather path?
 //
-// REAL components exercised here:
-//   - Core::HandleRasterizerWriteGate (src/core/gpu_write_gate.h, the verbatim
-//     production shortcut seam from Memory::Impl::HandleRasterizerWrite),
-//   - Core::GPUDirtyMemoryManager Collect/Gather (the production deferred
-//     record + drain),
-//   - VideoCommon::BufferCache<TestParams>::WriteMemory (the production
-//     consumer entry behind RasterizerVulkan::OnCPUWrite / OnCacheInvalidation),
-//   - VideoCommon::MemoryTrackerBase<Tegra::MaxwellDeviceMemoryManager> (the
-//     production tracker: WordManagers + UpdatePagesCachedCount notification
-//     path against a REAL manager, no process registered, unmapped pages read
-//     as zeros per SparseLargeVector semantics).
+// REAL components exercised:
+//   - Core::HandleRasterizerWriteGate (src/core/gpu_write_gate.h): the verbatim
+//     production shortcut seam from Memory::Impl::HandleRasterizerWrite.
+//   - Core::GPUDirtyMemoryManager Collect/Gather: the production deferred
+//     record + drain.
+//   - VideoCommon::BufferCache<TestParams>::WriteMemory: the production mark
+//     applied by the REAL drain consumer (RasterizerVulkan::OnCacheInvalidation
+//     calls exactly this under the buffer-cache mutex).
+//   - VideoCommon::MemoryTrackerBase<Tegra::MaxwellDeviceMemoryManager>: the
+//     production tracker class (real WordManagers), over a REAL manager
+//     instance with no process registered (unmapped pages read as zeros via
+//     SparseLargeVector; UpdatePagesCachedCount no-ops).
+//
+// FAITHFUL MODELING NOTES (verified against source at this commit):
+//   - The gate's on_cpu_write callable models RasterizerVulkan::OnCPUWrite
+//     (vk_rasterizer.cpp) -> BufferCache<P>::OnCPUWrite (buffer_cache.h):
+//       * unregistered range            -> false (no seed, no collect)
+//       * registered + GPU-modified      -> TRUE, and crucially WITHOUT calling
+//         WriteMemory: the CPU write is DEFERRED ENTIRELY; its only record is
+//         the gate's Collect. The fixture models this precondition by marking
+//         the region GPU-modified in the mirror tracker.
+//       * registered + not GPU-modified  -> WriteMemory immediately, false.
+//   - The gate seeds per YUZU (4 KiB) page; production rasterizer_write_areas
+//     is value-initialized (memory.cpp:778), so last_address starts at 0 and a
+//     first write to guest page 0 takes the skip path - tested below.
+//   - The tracker's CPU-modified granularity is one DEVICE page (4 KiB)
+//     (word_manager.h: BYTES_PER_PAGE = Core::DEVICE_PAGESIZE), so within one
+//     gate page the cache's IsRegionCpuModified CANNOT distinguish a second
+//     write from the first. The second-write assertions therefore rest on the
+//     mirror tracker's clean-baseline re-registration (the real unmark in
+//     ForEachUploadRange), not on a sub-page cache query.
 //
 // PARTIAL BOUNDARY - criterion 2 is NOT claimed passed from this fixture:
-//   - BufferCache's own memory_tracker member is private, so a standalone
-//     MemoryTrackerBase instance mirrors the same marks for range assertions;
-//     cache-side state is asserted through the public IsRegionCpuModified.
-//   - The real SynchronizeBuffer -> UploadMemory -> MappedUploadMemory data
-//     movement is NOT exercised: DeviceMemoryManager::Map requires a
-//     registered Core::Memory process (registered_processes[asid]), which
-//     needs a Core::System. The fixture performs the copy an upload would do
-//     over the exact ranges the real tracker yields.
+//   - The cache's OWN tracker is private; a standalone MemoryTrackerBase
+//     mirrors the same marks for range assertions. The cache stays CPU-marked
+//     after the fixture's syncs because the real consume (SynchronizeBuffer)
+//     is not run - asserted and labeled, not hidden.
+//   - The real SynchronizeBuffer -> UploadMemory data movement is NOT
+//     exercised: DeviceMemoryManager::Map requires a registered Core::Memory
+//     process (registered_processes[asid]); RegisterProcess is public
+//     (device_memory_manager.h:121) but Core::Memory::Memory's ctor requires
+//     Core::System& (core/memory.h:64) and this harness has no System fixture.
+//     The fixture copies over exactly the ranges the REAL tracker yields.
 //   - SynchronizeBuffer's gpu_modified_ranges exclusion is not exercised.
 
 #include <array>
@@ -197,10 +220,10 @@ bool CoversRange(const std::vector<Range>& ranges, u64 addr, u64 size) {
 
 } // namespace
 
-TEST_CASE("Criterion2 chain: second same-page write reaches consumer after revalidation",
+TEST_CASE("Criterion2 chain: deferred second same-page write re-registers after a clean "
+          "baseline",
           "[gpu_dirty]") {
-    // Region under test: one 4 KiB guest page (one gate subaddress) that is also
-    // inside one GPUDirtyMemoryManager 2048-byte page... use a 4 KiB window.
+    // One gate (4 KiB) page; GPUDirtyMemoryManager pages (2048 B) nest inside.
     constexpr PAddr kBase = 0x0000'0400'0000; // 4 KiB and 2048-byte aligned
     constexpr u64 kWindow = 4096;
     static_assert(kBase % Core::Memory::YUZU_PAGESIZE == 0);
@@ -215,15 +238,20 @@ TEST_CASE("Criterion2 chain: second same-page write reaches consumer after reval
     std::array<u8, 4096> shadow{};
     ChainTestBuffer buffer{runtime, kBase, kWindow};
 
-    PAddr gate_last_address = ~PAddr(0); // GPUDirtyState.last_address starts "no page"
+    // Production precondition for OnCPUWrite's TRUE (fully deferred) branch:
+    // the region is registered and GPU-modified.
+    mirror.MarkRegionAsGpuModified(kBase, kWindow);
+
+    PAddr gate_last_address = 0; // matches value-initialized rasterizer_write_areas
     unsigned on_cpu_write_calls = 0;
     unsigned collect_calls = 0;
+    unsigned drain_writes = 0;
 
-    const auto on_cpu_write = [&](DAddr addr, u64 size) {
+    // Faithful model of RasterizerVulkan::OnCPUWrite's true branch
+    // (registered + GPU-modified): returns true and does NOT mark the buffer
+    // cache; the write is deferred entirely.
+    const auto on_cpu_write = [&](DAddr, u64) {
         ++on_cpu_write_calls;
-        // What RasterizerVulkan::OnCPUWrite -> buffer_cache.WriteMemory does.
-        cache.WriteMemory(addr, size);
-        mirror.MarkRegionAsCpuModified(addr, size);
         return true;
     };
     const auto collect = [&](DAddr addr, u64 size) {
@@ -234,72 +262,72 @@ TEST_CASE("Criterion2 chain: second same-page write reaches consumer after reval
         Core::HandleRasterizerWriteGate(gate_last_address, paddr >> Core::Memory::YUZU_PAGEBITS,
                                         paddr, size, 0, on_cpu_write, collect);
     };
+    // The real drain consumer (GPU::InvalidateGPUCache ->
+    // RasterizerVulkan::OnCacheInvalidation -> buffer_cache.WriteMemory;
+    // texture/pipeline legs are out of scope here).
     const auto drain = [&] {
         std::function<void(PAddr, size_t)> cb = [&](PAddr addr, size_t size) {
-            // What GPU::InvalidateGPUCache -> OnCacheInvalidation ->
-            // buffer_cache.WriteMemory does.
+            ++drain_writes;
             cache.WriteMemory(addr, static_cast<u64>(size));
             mirror.MarkRegionAsCpuModified(addr, static_cast<u64>(size));
         };
         manager.Gather(cb);
     };
 
-    // Frame 1: first CPU write hits the full path (gate seeds, OnCPUWrite runs,
-    // and the deferred record ALSO collects - verbatim production sequencing).
+    // Frame 1: first CPU write runs the full gate path. OnCPUWrite accepts
+    // (true) WITHOUT marking; verbatim production sequencing still records the
+    // write in the deferred manager.
     std::memset(shadow.data(), 0xAA, 64); // value1 at [kBase, kBase+64)
     drive_gate(kBase, 64);
     REQUIRE(on_cpu_write_calls == 1);
     REQUIRE(collect_calls == 1);
     drain();
+    REQUIRE(drain_writes == 1);
     {
         const auto ranges = SyncUploads(mirror, kBase, kWindow, shadow, buffer);
         REQUIRE(CoversRange(ranges, kBase, 64));
         REQUIRE(std::all_of(buffer.host.begin(), buffer.host.begin() + 64,
                             [](u8 b) { return b == 0xAA; }));
-        // First sync cleared the CPU-modified tracking (real ForEachUploadRange
-        // unmarks): the next write must be registered from a clean slate.
+        // The real ForEachUploadRange unmarked what it yielded: clean baseline.
         REQUIRE(!mirror.IsRegionCpuModified(kBase, kWindow));
-        // The cache's own tracker still shows the mark (fixture does not run
-        // the real upload that would consume it - boundary note).
+        // The cache's own tracker remains marked: its real consume
+        // (SynchronizeBuffer) is not run in this fixture. Labeled boundary, and
+        // per the granularity note this mark cannot distinguish write 2 anyway.
         REQUIRE(cache.IsRegionCpuModified(kBase, 64));
     }
 
-    // Frame 2: second write to the SAME page. The gate shortcut skips
-    // OnCPUWrite; the deferred record is the only path to the consumer.
-    std::memset(shadow.data() + 64, 0xBB, 64); // value2 at [kBase+64, kBase+128)
-    drive_gate(kBase + 64, 64);
-    REQUIRE(on_cpu_write_calls == 1); // unchanged: shortcut skipped OnCPUWrite
+    // Frame 2: second CPU write, SAME gate page AND same range (value1 is
+    // replaced by value2). The gate shortcut skips OnCPUWrite entirely; the
+    // deferred record is the ONLY path to the consumer.
+    std::memset(shadow.data(), 0xBB, 64); // value2 replaces value1 at [kBase, kBase+64)
+    drive_gate(kBase, 64);
+    REQUIRE(on_cpu_write_calls == 1); // unchanged: the shortcut skipped OnCPUWrite
     REQUIRE(collect_calls == 2);
     drain();
+    REQUIRE(drain_writes == 2);
     {
-        // The drain callback delivered the second write to the REAL consumer
-        // entry: the cache's own tracker now marks the second range CPU-modified.
-        REQUIRE(cache.IsRegionCpuModified(kBase + 64, 64));
         const auto ranges = SyncUploads(mirror, kBase, kWindow, shadow, buffer);
-        // The tracker registered the second write from a clean slate: at least
-        // one range covers it, and nothing was left merged with frame 1 state.
+        // From a genuinely clean baseline (the real unmark in sync 1), the
+        // second write re-registered and is yielded again: this is the
+        // deferred-delivery evidence.
         REQUIRE(!ranges.empty());
-        REQUIRE(CoversRange(ranges, kBase + 64, 64));
-        REQUIRE(std::all_of(buffer.host.begin() + 64, buffer.host.begin() + 128,
-                            [](u8 b) { return b == 0xBB; }));
-        // Value1 from frame 1 is still intact in the buffer.
+        REQUIRE(CoversRange(ranges, kBase, 64));
+        // The buffer now holds value2 at that range...
         REQUIRE(std::all_of(buffer.host.begin(), buffer.host.begin() + 64,
-                            [](u8 b) { return b == 0xAA; }));
+                            [](u8 b) { return b == 0xBB; }));
+        // ...and untouched offsets stay zero (control).
+        REQUIRE(std::all_of(buffer.host.begin() + 64, buffer.host.end(),
+                            [](u8 b) { return b == 0x00; }));
         REQUIRE(!mirror.IsRegionCpuModified(kBase, kWindow));
     }
 }
 
-TEST_CASE("Criterion2 chain: write to a NEW page reopens the full path", "[gpu_dirty]") {
+TEST_CASE("Criterion2 chain: write to a NEW gate page reopens the full path", "[gpu_dirty]") {
     constexpr PAddr kBase = 0x0000'0400'0000;
-    constexpr PAddr kOtherPage = kBase + Core::Memory::YUZU_PAGESIZE; // different gate subaddress
+    constexpr PAddr kOtherPage = kBase + Core::Memory::YUZU_PAGESIZE;
 
-    Core::DeviceMemory backing;
-    Tegra::MaxwellDeviceMemoryManager gmmu{backing};
-    ChainTestRuntime runtime;
-    VideoCommon::BufferCache<ChainTestParams> cache{gmmu, runtime};
     Core::GPUDirtyMemoryManager manager;
-
-    PAddr gate_last_address = ~PAddr(0);
+    PAddr gate_last_address = 0;
     unsigned on_cpu_write_calls = 0;
     unsigned collect_calls = 0;
     const auto on_cpu_write = [&](DAddr, u64) {
@@ -316,37 +344,92 @@ TEST_CASE("Criterion2 chain: write to a NEW page reopens the full path", "[gpu_d
     };
 
     drive_gate(kBase, 64);
-    drive_gate(kBase, 64); // same page: skip
-    drive_gate(kOtherPage, 64); // new page: full path again
+    drive_gate(kBase, 64);       // same page: skip
+    drive_gate(kOtherPage, 64);  // new page: full path again
     REQUIRE(on_cpu_write_calls == 2);
     REQUIRE(collect_calls == 3);
-
-    std::function<void(PAddr, size_t)> cb = [](PAddr, size_t) {};
-    manager.Gather(cb);
+    REQUIRE(GatherAll(manager).size() == 2);
 }
 
-TEST_CASE("Criterion2 chain: rejected OnCPUWrite neither seeds nor collects", "[gpu_dirty]") {
+TEST_CASE("Criterion2 chain: rejected OnCPUWrite neither seeds nor collects, and a "
+          "rejection on another page does not unseed",
+          "[gpu_dirty]") {
     constexpr PAddr kBase = 0x0000'0400'0000;
+    constexpr PAddr kOtherPage = kBase + Core::Memory::YUZU_PAGESIZE;
     Core::GPUDirtyMemoryManager manager;
-    PAddr gate_last_address = ~PAddr(0);
+    PAddr gate_last_address = 0;
     unsigned collect_calls = 0;
-    const auto reject = [](DAddr, u64) { return false; };
+    unsigned full_calls = 0;
+    bool accept = true;
+    const auto on_cpu_write = [&](DAddr, u64) {
+        ++full_calls;
+        return accept;
+    };
+    const auto collect = [&](DAddr addr, u64 size) {
+        ++collect_calls;
+        manager.Collect(addr, size);
+    };
+    const auto drive_gate = [&](PAddr paddr, u64 size) {
+        Core::HandleRasterizerWriteGate(gate_last_address, paddr >> Core::Memory::YUZU_PAGEBITS,
+                                        paddr, size, 0, on_cpu_write, collect);
+    };
+
+    // First write REJECTED (unregistered range in production): no seed, no
+    // collect; the page is not latched.
+    accept = false;
+    drive_gate(kBase, 64);
+    REQUIRE(full_calls == 1);
+    REQUIRE(collect_calls == 0);
+    REQUIRE(GatherAll(manager).empty());
+
+    // Same page, now accepted: treated as a FIRST write (full path again),
+    // because the rejection did not seed it.
+    accept = true;
+    drive_gate(kBase, 64);
+    REQUIRE(full_calls == 2);
+    REQUIRE(collect_calls == 1);
+
+    // Same page again: skip path.
+    drive_gate(kBase, 64);
+    REQUIRE(full_calls == 2);
+    REQUIRE(collect_calls == 2);
+
+    // A REJECTED write to ANOTHER page must not unseed the first page:
+    // the rejection returns before touching last_address.
+    accept = false;
+    drive_gate(kOtherPage, 64);
+    REQUIRE(full_calls == 3);
+    REQUIRE(collect_calls == 2);
+    accept = true;
+    drive_gate(kBase, 64); // still the seeded page: skip, no full path
+    REQUIRE(full_calls == 3);
+    REQUIRE(collect_calls == 3);
+    REQUIRE(GatherAll(manager).size() == 1);
+}
+
+TEST_CASE("Criterion2 chain: first write to guest page 0 takes the skip path "
+          "(production initial state)",
+          "[gpu_dirty]") {
+    // rasterizer_write_areas is value-initialized (memory.cpp:778), so
+    // last_address starts at 0 == page 0's subaddress. A first write to guest
+    // page 0 therefore looks "already seeded" and skips OnCPUWrite. This test
+    // documents that production edge, it does not bless it.
+    Core::GPUDirtyMemoryManager manager;
+    PAddr gate_last_address = 0;
+    unsigned full_calls = 0;
+    unsigned collect_calls = 0;
+    const auto on_cpu_write = [&](DAddr, u64) {
+        ++full_calls;
+        return true;
+    };
     const auto collect = [&](DAddr addr, u64 size) {
         ++collect_calls;
         manager.Collect(addr, size);
     };
 
-    Core::HandleRasterizerWriteGate(gate_last_address, kBase >> Core::Memory::YUZU_PAGEBITS,
-                                    kBase, 64, 0, reject, collect);
-    // FALSE return: no seed, no collect (verbatim production order).
-    REQUIRE(collect_calls == 0);
-    REQUIRE(GatherAll(manager).empty());
-
-    // The page was not seeded, so the next write is treated as a FIRST write:
-    // the full path runs again.
-    const auto accept = [](DAddr, u64) { return true; };
-    Core::HandleRasterizerWriteGate(gate_last_address, kBase >> Core::Memory::YUZU_PAGEBITS,
-                                    kBase, 64, 0, accept, collect);
+    Core::HandleRasterizerWriteGate(gate_last_address, PAddr{0}, PAddr{0}, 64, 0, on_cpu_write,
+                                    collect);
+    REQUIRE(full_calls == 0);  // OnCPUWrite skipped for the very first write to page 0
     REQUIRE(collect_calls == 1);
-    REQUIRE(HasRange(GatherAll(manager), kBase, 64));
+    REQUIRE(HasRange(GatherAll(manager), 0, 64));
 }

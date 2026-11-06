@@ -15,6 +15,7 @@
 #include "common/common_types.h"
 #include <bit>
 #include <cstdio>
+#include <cstring>
 #include "common/diag_trace.h"
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
 #include "shader_recompiler/shader_info.h"
@@ -391,22 +392,27 @@ inline void PushImageDescriptors(TextureCache& texture_cache,
                 }
             }
             const u32 diag_flags = texture_cache.DiagImageFlagsOf(image_view.image_id);
-            if (Common::DiagTrace::tl_selected_draw ||
-                (diag_flags & (static_cast<u32>(VideoCommon::ImageFlagBits::Unbacked) |
-                               static_cast<u32>(VideoCommon::ImageFlagBits::UnwrittenSparse) |
-                               static_cast<u32>(VideoCommon::ImageFlagBits::ZeroFilled))) != 0) {
+            if (Common::DiagTrace::Enabled() &&
+                (Common::DiagTrace::tl_selected_draw ||
+                 (diag_flags & (static_cast<u32>(VideoCommon::ImageFlagBits::Unbacked) |
+                                static_cast<u32>(VideoCommon::ImageFlagBits::UnwrittenSparse) |
+                                static_cast<u32>(VideoCommon::ImageFlagBits::ZeroFilled))) != 0)) {
+                // b always carries the ORIGINAL image's trace id; the final
+                // resource is identified by d (raw VkImageView) + the tag's
+                // final-kind char: k=kept original, n=null fallback, o=nx2 override.
                 char diag_tag[48];
-                std::snprintf(diag_tag, sizeof(diag_tag), "s%u x%llx#%u ty%u g%llu%s%s",
-                              diag_stage, (unsigned long long)desc.cbuf_offset, index,
-                              static_cast<u32>(desc.type),
-                              (unsigned long long)texture_cache.DiagViewGenOf(image_view_id),
-                              diag_null_fb ? " null-fallback" : "",
-                              diag_ovr ? " nx2-override" : "");
+                const int diag_len = std::snprintf(
+                    diag_tag, sizeof(diag_tag), "s%u x%llx#%u ty%u g%llu f%c", diag_stage,
+                    (unsigned long long)desc.cbuf_offset, index, static_cast<u32>(desc.type),
+                    (unsigned long long)texture_cache.DiagViewGenOf(image_view_id),
+                    diag_null_fb ? 'n' : (diag_ovr ? 'o' : 'k'));
+                if (diag_len < 0 || static_cast<size_t>(diag_len) >= sizeof(diag_tag)) {
+                    Common::DiagTrace::S().tag_truncated.fetch_add(1, std::memory_order_relaxed);
+                    std::memcpy(diag_tag + sizeof(diag_tag) - 4, "~TR", 4);
+                }
                 Common::DiagTrace::Emit(Common::DiagTrace::Ev::DescFinal,
                                         texture_cache.FrameTick(), Common::DiagTrace::tl_draw_seq,
-                                        diag_null_fb || diag_ovr
-                                            ? 0
-                                            : texture_cache.DiagTraceObjOf(image_view.image_id),
+                                        texture_cache.DiagTraceObjOf(image_view.image_id),
                                         image_view_id.index,
                                         std::bit_cast<u64>(vk_image_view), diag_tag);
             }
@@ -426,12 +432,18 @@ inline void PushImageDescriptors(TextureCache& texture_cache,
                 texture_cache.MarkModification(image_view.image_id);
             }
             const VkImageView vk_image_view{image_view.StorageView(desc.type, desc.format)};
-            if (Common::DiagTrace::tl_selected_draw) {
+            if (Common::DiagTrace::Enabled() && Common::DiagTrace::tl_selected_draw) {
                 char diag_tag[48];
-                std::snprintf(diag_tag, sizeof(diag_tag), "s%u x%llx#%u ty%u storage%s", diag_stage,
-                              (unsigned long long)desc.cbuf_offset, index,
-                              static_cast<u32>(desc.type),
-                              desc.is_written ? " written" : "");
+                const int diag_len = std::snprintf(
+                    diag_tag, sizeof(diag_tag), "s%u x%llx#%u ty%u g%llu storage%s", diag_stage,
+                    (unsigned long long)desc.cbuf_offset, index, static_cast<u32>(desc.type),
+                    (unsigned long long)texture_cache.DiagViewGenOf(
+                        VideoCommon::ImageViewId{(views - 1)->id}),
+                    desc.is_written ? " written" : "");
+                if (diag_len < 0 || static_cast<size_t>(diag_len) >= sizeof(diag_tag)) {
+                    Common::DiagTrace::S().tag_truncated.fetch_add(1, std::memory_order_relaxed);
+                    std::memcpy(diag_tag + sizeof(diag_tag) - 4, "~TR", 4);
+                }
                 Common::DiagTrace::Emit(Common::DiagTrace::Ev::DescFinal,
                                         texture_cache.FrameTick(), Common::DiagTrace::tl_draw_seq,
                                         texture_cache.DiagTraceObjOf(image_view.image_id),

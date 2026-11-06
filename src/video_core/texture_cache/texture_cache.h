@@ -497,7 +497,8 @@ void TextureCache<P>::TickFrame() {
     }
     ++frame_tick;
     Common::DiagTrace::TickFlush(frame_tick);
-    if (!diag_snapshot_done && Common::DiagTrace::InWindow(frame_tick)) {
+    if (Common::DiagTrace::Enabled() && !diag_snapshot_done &&
+        Common::DiagTrace::InWindow(frame_tick)) {
         // Pre-window identity snapshot: the live table state when capture begins.
         diag_snapshot_done = true;
         for (const auto& [slot, rec] : diag_images_) {
@@ -507,7 +508,8 @@ void TextureCache<P>::TickFrame() {
                                     rec.trace_obj, slot, rec.gpu_addr, rec.state, diag_tag);
         }
         Common::DiagTrace::Emit(Common::DiagTrace::Ev::Config, frame_tick,
-                                diag_images_.size(), diag_identity_skipped, 0, 0,
+                                diag_images_.size(), diag_identity_skipped,
+                                diag_view_gen_.size(), diag_view_gen_skipped,
                                 "identity-snapshot-done");
     }
 
@@ -2474,7 +2476,10 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
         revived_id ? revived_id : slot_images.insert(runtime, new_info, gpu_addr, cpu_addr);
     Image& new_image = slot_images[new_image_id];
     u64 diag_trace_obj = 0;
-    if (revived_id) {
+    if (Common::DiagTrace::Enabled()) {
+        // Diagnostic identity tracking only; skipped entirely when the master
+        // switch is off (no allocations, no map inserts, no formatting).
+        if (revived_id) {
         // Same slot object revived: keep its trace identity, bump the generation.
         if (auto dit = diag_images_.find(new_image_id.index); dit != diag_images_.end()) {
             dit->second.state = 0;
@@ -2512,6 +2517,7 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
         Common::DiagTrace::Emit(Common::DiagTrace::Ev::ImageCreate, frame_tick,
                                 diag_trace_obj, new_image_id.index, gpu_addr,
                                 new_image.guest_size_bytes, diag_shape);
+        }
     }
 
     new_image.allocation_tick = frame_tick;
@@ -3246,7 +3252,7 @@ ImageViewId TextureCache<P>::FindOrEmplaceImageView(ImageId image_id, const Imag
     if (const ImageViewId image_view_id = image.FindView(info); image_view_id) {
         Common::DiagTrace::Emit(Common::DiagTrace::Ev::ViewCacheHit, frame_tick,
                                 image_view_id.index, DiagTraceObjOf(image_id),
-                                diag_view_gen_[image_view_id.index], 0);
+                                DiagViewGenOf(image_view_id), 0);
         return image_view_id;
     }
     if (True(image.flags & ImageFlagBits::Unbacked) &&
@@ -3258,7 +3264,16 @@ ImageViewId TextureCache<P>::FindOrEmplaceImageView(ImageId image_id, const Imag
                  info.range.extent.layers);
     }
     const ImageViewId image_view_id = slot_image_views.insert(runtime, info, image_id, image, slot_images);
-    const u64 diag_vgen = ++diag_view_gen_[image_view_id.index];
+    u64 diag_vgen = 0;
+    if (Common::DiagTrace::Enabled()) {
+        // Bounded like the image identity map: existing keys always update;
+        // new keys beyond the cap are skipped and counted.
+        if (diag_view_gen_.size() < 262144 || diag_view_gen_.contains(image_view_id.index)) {
+            diag_vgen = ++diag_view_gen_[image_view_id.index];
+        } else {
+            ++diag_view_gen_skipped;
+        }
+    }
     Common::DiagTrace::Emit(Common::DiagTrace::Ev::ViewCreate, frame_tick,
                             image_view_id.index, DiagTraceObjOf(image_id), diag_vgen,
                             static_cast<u64>(info.type));

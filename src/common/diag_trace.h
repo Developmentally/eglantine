@@ -60,7 +60,7 @@ enum class Ev : u8 {
     ViewErase,       // a=view_slot
     Draw,            // a=draw_seq b=vertex_count c=instance_count d=indexed (in record lambda)
     DrawSkip,        // a=draw_seq tag=reason
-    DescFinal,       // a=draw_seq b=image_trace_obj c=view_slot d=final VkImageView handle
+    DescFinal,       // a=draw_seq b=ORIGINAL image_trace_obj (kept on substitution) c=view_slot d=final VkImageView handle; tag f=final kind k/n/o
                      // tag=stage/ordinal/type/substitution-reason
     DescRoute,       // a=draw_seq b=route(0=descbuf 1=push 2=updset 255=null-pipeline)
                      // c=num_entries d=reused_allocation (inside record lambda)
@@ -98,6 +98,7 @@ struct State {
     std::array<std::atomic<u64>, static_cast<size_t>(Ev::Count)> dropped{};
     std::atomic<u64> attempted{0};
     std::atomic<u64> skipped_window{0};
+    std::atomic<u64> tag_truncated{0}; // descriptor tags that did not fit their field
     std::atomic<u64> next_obj_id{1};
     std::atomic<u64> draw_seq{0};
     std::atomic<s64> selected_draws_remaining{0};
@@ -140,10 +141,12 @@ inline void ReadEnvOnce() {
         s.flush_every = (std::max)(u64{1}, EnvU64("EDEN_NX2_TRACE_FLUSH_EVERY", 1));
         s.max_lines = EnvU64("EDEN_NX2_TRACE_MAX_LINES", 200000);
         s.enabled.store(EnvU64("EDEN_NX2_TRACE", 0) != 0, std::memory_order_relaxed);
-        LOG_INFO(HW_GPU,
-                 "T3TRACE init draws={} window=[{},{}] flush_every={} max_lines={}",
-                 s.selected_draws_remaining.load(), s.from_frame, s.to_frame, s.flush_every,
-                 s.max_lines);
+        if (s.enabled.load(std::memory_order_relaxed)) {
+            LOG_INFO(HW_GPU,
+                     "T3TRACE init draws={} window=[{},{}] flush_every={} max_lines={}",
+                     s.selected_draws_remaining.load(), s.from_frame, s.to_frame, s.flush_every,
+                     s.max_lines);
+        }
     });
 }
 
@@ -154,6 +157,14 @@ inline bool InWindow(u64 frame) {
 
 inline u64 CurrentFrame() {
     return S().current_frame.load(std::memory_order_relaxed);
+}
+
+// Master-switch read for guarding pre-Emit diagnostic work (identity maps,
+// tag formatting, generation maps): when OFF those sites skip ALL observer
+// work, not just the Emit call.
+inline bool Enabled() {
+    ReadEnvOnce();
+    return S().enabled.load(std::memory_order_relaxed);
 }
 
 inline thread_local u64 tl_draw_seq = 0;
@@ -196,22 +207,24 @@ inline void Emit(Ev cls, u64 frame, u64 a, u64 b, u64 c, u64 d, const char* tag 
     if (!s.enabled.load(std::memory_order_relaxed)) {
         return; // master switch off: one atomic load of overhead, no counters
     }
+    // Exact capture boundary: once the halt is observed the event is neither
+    // captured nor counted, so the counters printed at halt are final and
+    // exact for everything before the boundary.
+    if (s.capture_halted.load(std::memory_order_relaxed)) {
+        return;
+    }
     const size_t i = static_cast<size_t>(cls);
     s.attempted.fetch_add(1, std::memory_order_relaxed);
     if (!InWindow(frame)) {
         s.skipped_window.fetch_add(1, std::memory_order_relaxed);
         return;
     }
-    if (s.capture_halted.load(std::memory_order_relaxed)) {
-        // Capture halted: the event is lost, but the counter keeps the loss visible.
-        s.dropped[i].fetch_add(1, std::memory_order_relaxed);
-        return;
-    }
     std::lock_guard lock{s.mutex};
     if (s.capture_halted.load(std::memory_order_relaxed)) {
-        // Recheck under lock: a writer may have passed the fast-path check while a
-        // halting flush held the mutex; charge the class and refuse the append.
-        s.dropped[i].fetch_add(1, std::memory_order_relaxed);
+        // Boundary race: this writer passed the pre-halt fast check but lost the
+        // lock race against the halting flush. Dropped without counting; the
+        // race window is bounded by the flush duration and acknowledged in the
+        // terminal notice.
         return;
     }
     if (s.head - s.tail == s.ring.size()) {
@@ -255,9 +268,10 @@ inline std::string CounterSummary() {
             out += fmt::format(" {}={}/drop{}", ClsName(static_cast<u32>(i)), em, dr);
         }
     }
-    out += fmt::format(" attempted={} skipped_window={}",
+    out += fmt::format(" attempted={} skipped_window={} tag_truncated={}",
                        S().attempted.load(std::memory_order_relaxed),
-                       S().skipped_window.load(std::memory_order_relaxed));
+                       S().skipped_window.load(std::memory_order_relaxed),
+                       S().tag_truncated.load(std::memory_order_relaxed));
     return out;
 }
 
@@ -275,8 +289,9 @@ inline void Flush(u64 frame, const char* why) {
         s.tail = s.head;
         if (!s.terminal_notice_done.exchange(true, std::memory_order_relaxed)) {
             LOG_CRITICAL(HW_GPU,
-                         "T3TRACE halted: line budget {} exhausted; events now counted as "
-                         "dropped only. Final counters:{}", s.max_lines, CounterSummary());
+                         "T3TRACE halted: line budget {} exhausted. Events after the halt are "
+                         "neither captured nor counted; counters are final and exact as of "
+                         "the capture boundary:{}", s.max_lines, CounterSummary());
         }
         return;
     }
@@ -294,8 +309,10 @@ inline void Flush(u64 frame, const char* why) {
             s.terminal_notice_done.store(true, std::memory_order_relaxed);
             LOG_CRITICAL(HW_GPU,
                          "T3TRACE capture halted: event-line budget {} exhausted; buffered "
-                         "events discarded and counted as dropped. Counter snapshot at halt "
-                         "(post-halt losses counted internally, NOT printed):{}",
+                         "events discarded and counted as dropped. Counters are final and "
+                         "exact as of this halt; events after it are neither captured nor "
+                         "counted (a writer racing this flush can lose one event uncounted, "
+                         "bounded by the flush duration):{}",
                          s.max_lines, CounterSummary());
             return;
         }

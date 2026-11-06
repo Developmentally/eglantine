@@ -175,6 +175,7 @@ class TextureCache : public VideoCommon::ChannelSetupCaches<TextureCacheChannelI
     std::unordered_map<u32, DiagImageRec> diag_images_;        // slot index -> record
     std::unordered_map<u32, u64> diag_view_gen_;               // view slot -> generation
     u64 diag_identity_skipped = 0;
+    u64 diag_view_gen_skipped = 0; // view-gen entries dropped at the capacity bound
     bool diag_snapshot_done = false;
     std::vector<ImageId> unbacked_image_ids; ///< Registered images without host memory
     u64 unbacked_retries{};
