@@ -34,8 +34,12 @@ STEP 1 - seed the diagnostic settings from your ACTUAL working settings:
   target is replaced, never written through, and a failed seed leaves the
   old file untouched) and records a receipt (source path, both hashes) in
   eglantine-test3-sessions.log plus the eglantine-test3.seeded marker. The
-  launcher REFUSES to run until the marker exists, and also refuses if
-  eglantine-test3.ini is a symlink - there is no bypass. (To run with the
+  launcher REFUSES to run until a VALID marker exists (a readable, non-empty
+  receipt file - an empty, partial or malformed marker does not count), and
+  also refuses if eglantine-test3.ini is a symlink - there is no bypass. A
+  seed that fails at any step (copy, hashing, hash match, log append, marker
+  publication) exits nonzero and leaves no valid marker, so a broken seed
+  can never permit a launch. (To run with the
   packaged default on purpose, seed from this folder's eglantine-deck.ini;
   the receipt records that choice.)
 

@@ -37,9 +37,12 @@ receipt="$here/eglantine-test3.seeded"
 # Explicit seed action: atomically byte-copy the given working ini over the
 # kit's diagnostic ini (temp file + rename, so a symlinked or busy dest is
 # replaced, never written through, and a failed seed never truncates it) and
-# record a receipt. The receipt marker is REMOVED first and rewritten only
-# after the copy completes - an interrupted seed leaves no marker and the
-# launcher stays fail-closed. No path guessing, no equality heuristics.
+# record a receipt. The receipt marker is REMOVED first (checked; a marker
+# that cannot be removed is chmod 000 so the launch gate still refuses) and
+# published only after the copy, the status-checked hash match, and the
+# sessions-log receipt line all succeed - atomically (temp + rename, then
+# verified), so a failed or partial write never leaves a marker. No path
+# guessing, no equality heuristics.
 # Seeding from the kit's own packaged default is allowed and recorded as
 # such (a deliberate choice).
 if [ "${1:-}" = "--seed-from" ]; then
@@ -48,39 +51,94 @@ if [ "${1:-}" = "--seed-from" ]; then
     [ -f "$src" ] || die "seed source $src does not exist or is not a file"
     [ "$(realpath -m -- "$src")" != "$(realpath -m -- "$EGLANTINE_SETTINGS")" ] || die "seed source IS this kit's eglantine-test3.ini itself - a self-copy proves nothing. Point --seed-from at your WORKING build's eglantine-deck.ini"
     tmp="$here/.eglantine-test3.ini.tmp.$$"
-    rm -f "$receipt"
+    # Clear any previous marker FIRST, and CHECK the clearing: a stale marker
+    # must never survive a failed reseed. If the file cannot be removed (e.g.
+    # the kit directory is unwritable), neutralize it (chmod 000, possible
+    # without directory write permission) so the launch gate's readability
+    # check still refuses, and die loudly either way.
+    if [ -e "$receipt" ] || [ -L "$receipt" ]; then
+        rm -f -- "$receipt" 2>/dev/null
+        if [ -e "$receipt" ] || [ -L "$receipt" ]; then
+            if [ -f "$receipt" ]; then
+                if chmod 000 "$receipt" 2>/dev/null; then
+                    note="it was chmod 000, so the launch gate's readability check still refuses"
+                else
+                    note="it could not be neutralized - REMOVE IT MANUALLY before launching"
+                fi
+            else
+                note="it is not a regular file, so the launch gate already refuses it"
+            fi
+            die "could not clear the previous seed marker '$receipt' - seed aborted before copying; $note"
+        fi
+    fi
     if ! cp -- "$src" "$tmp" || ! mv -f -- "$tmp" "$EGLANTINE_SETTINGS"; then
         rm -f "$tmp"
         die "seed copy from $src failed; the previous settings file is untouched and the seed marker is cleared - seed again before running"
     fi
     # Fail-closed receipt: every step must succeed, the hashes must MATCH, the
     # evidence line must land in the sessions log BEFORE the marker exists, and
-    # the marker write itself must succeed. Any failure dies nonzero with no
-    # valid marker, so a broken seed can never permit a launch.
-    if ! src_hash="$(sha256sum -- "$src" | cut -d' ' -f1)" || [ -z "$src_hash" ]; then
-        die "could not hash the seed source '$src' - no marker written; fix the source and seed again"
-    fi
-    if ! dst_hash="$(sha256sum -- "$EGLANTINE_SETTINGS" | cut -d' ' -f1)" || [ -z "$dst_hash" ]; then
-        die "could not hash the freshly seeded settings file - no marker written; seed again before running"
-    fi
+    # the marker must be published ATOMICALLY (temp + rename, verified after).
+    # Any failure dies nonzero with no valid marker, so a broken seed can
+    # never permit a launch.
+    # Hash WITHOUT a pipeline: sha256sum's own exit status is checked (a
+    # `| cut` pipeline would mask a nonzero exit behind cut's status), and the
+    # digest must BE a 64-char lowercase-hex string - a plausible-looking but
+    # invalid digest is rejected.
+    hash_of() { # path -> validated 64-hex digest on stdout, or die
+        local out h
+        if ! out="$(sha256sum -- "$1")"; then
+            die "could not hash '$1' (sha256sum exited nonzero) - no marker written; seed again before running"
+        fi
+        h="${out%% *}"
+        case "$h" in
+            ""|*[!0-9a-f]*) die "sha256sum output for '$1' is not a 64-char lowercase-hex digest ('$h') - no marker written; seed again" ;;
+        esac
+        [ "${#h}" -eq 64 ] || die "sha256sum output for '$1' is not a 64-char lowercase-hex digest ('$h') - no marker written; seed again"
+        printf '%s' "$h"
+    }
+    src_hash="$(hash_of "$src")" || exit 1
+    dst_hash="$(hash_of "$EGLANTINE_SETTINGS")" || exit 1
     [ "$src_hash" = "$dst_hash" ] || \
         die "seed hash mismatch (source $src_hash != installed $dst_hash) - the copy did not land intact; no marker written"
     receipt_line="eglantine-test3: seeded settings from '$src' src-sha256=$src_hash dst-sha256=$dst_hash"
     if ! printf '%s\n' "$receipt_line" >> "$sessions"; then
         die "could not append the seed receipt to the sessions log '$sessions' - marker NOT written; fix the sessions log and seed again"
     fi
-    if ! printf '%s\n' "$receipt_line" > "$receipt"; then
-        die "could not write the seed receipt marker '$receipt' - the evidence line is in the sessions log, but the marker is absent so the launcher stays fail-closed"
+    # Atomic publish: write the marker to a temp file and rename it over the
+    # marker path, so a failed or partial write NEVER leaves a regular marker
+    # file behind (the launch gate checks only this path). Then VERIFY the
+    # published marker is a regular file with exactly the receipt line.
+    receipt_tmp="$here/.eglantine-test3.seeded.tmp.$$"
+    if ! printf '%s\n' "$receipt_line" > "$receipt_tmp"; then
+        rm -f "$receipt_tmp"
+        die "could not write the seed receipt (temp) - the evidence line is in the sessions log, but NO marker was published; the launcher stays fail-closed"
+    fi
+    if ! mv -f -- "$receipt_tmp" "$receipt"; then
+        rm -f "$receipt_tmp"
+        die "could not publish the seed receipt marker '$receipt' - the evidence line is in the sessions log, but NO marker was published; the launcher stays fail-closed"
+    fi
+    if [ ! -f "$receipt" ] || ! grep -qxF "$receipt_line" "$receipt"; then
+        rm -f "$receipt" "$receipt/${receipt_tmp##*/}"
+        die "seed receipt marker verification failed after publication (a non-file such as a directory may shadow '$receipt') - the launcher stays fail-closed"
     fi
     printf '%s\n' "$receipt_line" >&2
     exit 0
 fi
 
-# Fail-closed: refuse to run until an explicit seed receipt marker exists.
-if [ ! -f "$receipt" ]; then
+# Fail-closed: refuse to run until an explicit seed receipt marker exists as
+# a READABLE, NON-EMPTY regular file with the exact receipt shape. An empty,
+# partial, unreadable (neutralized), or malformed marker never permits a
+# launch.
+marker_ok=0
+if [ -f "$receipt" ] && [ -r "$receipt" ] && [ -s "$receipt" ]; then
+    if grep -qE "^eglantine-test3: seeded settings from '.+' src-sha256=[0-9a-f]{64} dst-sha256=[0-9a-f]{64}$" "$receipt" 2>/dev/null; then
+        marker_ok=1
+    fi
+fi
+if [ "$marker_ok" != 1 ]; then
     clue=""
     [ -z "$inherited_settings" ] || clue=" (inherited EGLANTINE_SETTINGS=$inherited_settings is recorded above as a possible source clue - verify it is your working ini before using it)"
-    die "settings not seeded yet. Run: ./eglantine-test3.sh --seed-from <path to your working eglantine-deck.ini>$clue (see README-test3.txt)"
+    die "settings not seeded yet (no valid seed receipt marker). Run: ./eglantine-test3.sh --seed-from <path to your working eglantine-deck.ini>$clue (see README-test3.txt)"
 fi
 # Run-time guard: a symlinked OR hardlinked settings file would make the
 # build's startup rewrite write through to whatever shares the inode
