@@ -24,8 +24,12 @@ STEP 1 - seed the diagnostic settings from your ACTUAL working settings:
   build rewrites its own ini at every launch, so yours may differ. Seed the
   diagnostic settings from your working build BEFORE the first launch:
     ./eglantine-test3.sh --seed-from "/home/deck/Downloads/eglantine-steamdeck-dev-tc-memory-ports-d551c07/eglantine-deck.ini"
-  (That is the settings file your working d551 launcher uses, per your
-  working shortcut: Start In /home/deck/Downloads/eglantine-steamdeck-dev-tc-memory-ports-d551c07.)
+  (Recovered default CANDIDATE: your working shortcut's Start In folder is
+  /home/deck/Downloads/eglantine-steamdeck-dev-tc-memory-ports-d551c07, so
+  its eglantine-deck.ini should be your working settings - but the shortcut
+  proves the folder, not the file's current bytes. If you ever launch with
+  EGLANTINE_SETTINGS pointing at a different file, seed from THAT file
+  instead.)
   This atomically byte-copies the file (temp + rename; a symlinked or busy
   target is replaced, never written through, and a failed seed leaves the
   old file untouched) and records a receipt (source path, both hashes) in
@@ -69,12 +73,19 @@ Limits you will hit on purpose:
     Each session records the settings hash before startup and after exit, so
     a diff against the receipt is the startup normalization, not tampering.
     Re-seed (same command) whenever your working settings change.
-  - The session log carries two env records per run: the launcher's own
-    pre-launch line, then the standard launcher's "eglantine-deck:" line with
-    the FINAL effective env (it applies its own defaults, e.g. AUTO_STUB).
-    All deck/app stderr is captured and appended after the run (bounded to
-    the last 128 KiB, replayed to the screen too); every line group carries
-    a session id like [20261106-003000.1234].
+  - The session log carries the launcher's own pre-launch env line, then
+    the standard launcher's "eglantine-deck:" FINAL effective-env record,
+    kept as its own lines so it survives any run volume (deck.sh applies its
+    own defaults, e.g. AUTO_STUB). Deck/app stderr goes to a temp file during
+    the run and only the LAST 128 KiB is appended after the run (replayed to
+    the screen too) - earlier stderr beyond that window is not in the log,
+    and live feedback is delayed until the app exits. The temp file grows
+    unbounded DURING the run and the session log grows with every session;
+    fine for a short diagnostic campaign. If the launcher is killed mid-run
+    (terminal closed, Deck shutdown, hang), the append never happens and the
+    FULL stderr stays in a hidden .eglantine-test3-stderr.* file in this
+    folder - send that file too; it is never deleted automatically. Every
+    line group carries a session id like [20261106-003000.1234].
   - eglantine-test3.ini must stay a real, singly-linked file: the launcher
     REFUSES to run if it is a symlink or has extra hard links (either would
     make the build's startup rewrite write through to the file it aliases).

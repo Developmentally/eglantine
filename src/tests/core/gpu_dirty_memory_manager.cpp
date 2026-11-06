@@ -53,6 +53,42 @@ TEST_CASE("DiagTrace names every event class", "[diagtrace]") {
                     std::string(Common::DiagTrace::ClsName(j)));
         }
     }
+    // Uniqueness cannot catch a permutation: pin every class to its exact
+    // expected name at runtime too (the header carries the same mapping as
+    // compile-time static_asserts).
+    static constexpr std::pair<Common::DiagTrace::Ev, const char*> kGolden[] = {
+        {Common::DiagTrace::Ev::ImageCreate, "ImageCreate"},
+        {Common::DiagTrace::Ev::ImageErase, "ImageErase"},
+        {Common::DiagTrace::Ev::ImageRevive, "ImageRevive"},
+        {Common::DiagTrace::Ev::RelatedEvict, "RelatedEvict"},
+        {Common::DiagTrace::Ev::ViewCreate, "ViewCreate"},
+        {Common::DiagTrace::Ev::ViewCacheHit, "ViewCacheHit"},
+        {Common::DiagTrace::Ev::ViewErase, "ViewErase"},
+        {Common::DiagTrace::Ev::Draw, "Draw"},
+        {Common::DiagTrace::Ev::DrawSkip, "DrawSkip"},
+        {Common::DiagTrace::Ev::DescFinal, "DescFinal"},
+        {Common::DiagTrace::Ev::DescRoute, "DescRoute"},
+        {Common::DiagTrace::Ev::RTBind, "RTBind"},
+        {Common::DiagTrace::Ev::CopyDep, "CopyDep"},
+        {Common::DiagTrace::Ev::BufEpoch, "BufEpoch"},
+        {Common::DiagTrace::Ev::HrwSeed, "HrwSeed"},
+        {Common::DiagTrace::Ev::HrwSkip, "HrwSkip"},
+        {Common::DiagTrace::Ev::HrwCollect, "HrwCollect"},
+        {Common::DiagTrace::Ev::HrwBufAccept, "HrwBufAccept"},
+        {Common::DiagTrace::Ev::HrwBufReject, "HrwBufReject"},
+        {Common::DiagTrace::Ev::HrwGather, "HrwGather"},
+        {Common::DiagTrace::Ev::HrwDrain, "HrwDrain"},
+        {Common::DiagTrace::Ev::HrwCacheInval, "HrwCacheInval"},
+        {Common::DiagTrace::Ev::HrwUpload, "HrwUpload"},
+        {Common::DiagTrace::Ev::Config, "Config"},
+        {Common::DiagTrace::Ev::IdentitySnap, "IdentitySnap"},
+        {Common::DiagTrace::Ev::ImageDormant, "ImageDormant"},
+        {Common::DiagTrace::Ev::ImageUpload, "ImageUpload"},
+        {Common::DiagTrace::Ev::DrawBuf, "DrawBuf"},
+    };
+    for (const auto& [ev, name] : kGolden) {
+        REQUIRE(std::string(Common::DiagTrace::ClsName(static_cast<u32>(ev))) == name);
+    }
 }
 
 TEST_CASE("GPUDirtyMemoryManager: second same-page write is delivered", "[gpu_dirty]") {

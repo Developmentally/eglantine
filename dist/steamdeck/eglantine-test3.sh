@@ -127,18 +127,25 @@ echo "eglantine-test3: [$sid] diagnostic capture (evidence only, not a fix); set
 
 # deck.sh applies its own defaults AFTER the wrapper's record above (e.g.
 # EDEN_NX2_AUTO_STUB=1, --frames-ahead -> EDEN_NX2_FRAMES_AHEAD=a) and echoes
-# the final effective env to stderr. Capture ALL deck/app stderr to a temp
-# file and append it to the sessions log AFTER the run: synchronous (no lost
-# tail, no ordering ambiguity), bounded to the last 128 KiB.
+# the final effective env to stderr AT STARTUP. Capture ALL deck/app stderr to
+# a temp file; after the run, append the deck env line(s) as their own record
+# FIRST (they survive any run volume), then the bounded tail. The temp file
+# grows unbounded DURING the run; it is removed only after a successful
+# append, so a wrapper kill (or a failed append) never loses the only copy.
 deck_err="$here/.eglantine-test3-stderr.$sid"
 "$here/eglantine-deck.sh" --appimage "$appimage" "$@" 2> "$deck_err"
 rc=$?
 ini_hash_after="$(sha256sum "$EGLANTINE_SETTINGS" | cut -d' ' -f1)"
-{
-    echo "eglantine-test3: [$sid] deck/app stderr follows (bounded to the last 131072 bytes):"
+if {
+    echo "eglantine-test3: [$sid] deck effective-env record (kept separate so it survives any run volume):"
+    grep '^eglantine-deck:' "$deck_err" || echo "eglantine-test3: [$sid] (no eglantine-deck: env line found in captured stderr)"
+    echo "eglantine-test3: [$sid] deck/app stderr follows (bounded to the LAST 131072 bytes; earlier output beyond that window is only in the temp file, which is removed after this append succeeds):"
     tail -c 131072 "$deck_err"
     echo "eglantine-test3: [$sid] end of deck/app stderr"
-} | tee -a "$sessions" >&2
-rm -f "$deck_err"
+} | tee -a "$sessions" >&2; then
+    rm -f "$deck_err"
+else
+    echo "eglantine-test3: [$sid] WARNING: sessions-log append FAILED; FULL stderr retained at $deck_err - send that file too" | tee -a "$sessions" >&2
+fi
 echo "eglantine-test3: [$sid] session ended rc=$rc settings-sha256 before=$ini_hash_before after=$ini_hash_after" | tee -a "$sessions" >&2
 exit $rc

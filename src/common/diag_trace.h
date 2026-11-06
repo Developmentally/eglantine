@@ -54,6 +54,7 @@
 #include <mutex>
 #include <new>
 #include <string>
+#include <string_view>
 #include <type_traits>
 
 #include <fmt/format.h>
@@ -474,6 +475,42 @@ inline constexpr std::array kClsNames{
 };
 static_assert(kClsNames.size() == static_cast<size_t>(Ev::Count),
               "every Ev class must have exactly one ClsName entry, in order");
+
+// Golden per-class mapping: a permuted-but-unique names table still passes the
+// count assert above and the runtime named/unique test, so pin every class to
+// its own exact name at compile time.
+#define EDEN_DIAGTRACE_GOLDEN(ev, name)                                                        \
+    static_assert(std::string_view(kClsNames[static_cast<size_t>(Ev::ev)]) == name,            \
+                  "kClsNames[" #ev "] must be exactly " name)
+EDEN_DIAGTRACE_GOLDEN(ImageCreate, "ImageCreate");
+EDEN_DIAGTRACE_GOLDEN(ImageErase, "ImageErase");
+EDEN_DIAGTRACE_GOLDEN(ImageRevive, "ImageRevive");
+EDEN_DIAGTRACE_GOLDEN(RelatedEvict, "RelatedEvict");
+EDEN_DIAGTRACE_GOLDEN(ViewCreate, "ViewCreate");
+EDEN_DIAGTRACE_GOLDEN(ViewCacheHit, "ViewCacheHit");
+EDEN_DIAGTRACE_GOLDEN(ViewErase, "ViewErase");
+EDEN_DIAGTRACE_GOLDEN(Draw, "Draw");
+EDEN_DIAGTRACE_GOLDEN(DrawSkip, "DrawSkip");
+EDEN_DIAGTRACE_GOLDEN(DescFinal, "DescFinal");
+EDEN_DIAGTRACE_GOLDEN(DescRoute, "DescRoute");
+EDEN_DIAGTRACE_GOLDEN(RTBind, "RTBind");
+EDEN_DIAGTRACE_GOLDEN(CopyDep, "CopyDep");
+EDEN_DIAGTRACE_GOLDEN(BufEpoch, "BufEpoch");
+EDEN_DIAGTRACE_GOLDEN(HrwSeed, "HrwSeed");
+EDEN_DIAGTRACE_GOLDEN(HrwSkip, "HrwSkip");
+EDEN_DIAGTRACE_GOLDEN(HrwCollect, "HrwCollect");
+EDEN_DIAGTRACE_GOLDEN(HrwBufAccept, "HrwBufAccept");
+EDEN_DIAGTRACE_GOLDEN(HrwBufReject, "HrwBufReject");
+EDEN_DIAGTRACE_GOLDEN(HrwGather, "HrwGather");
+EDEN_DIAGTRACE_GOLDEN(HrwDrain, "HrwDrain");
+EDEN_DIAGTRACE_GOLDEN(HrwCacheInval, "HrwCacheInval");
+EDEN_DIAGTRACE_GOLDEN(HrwUpload, "HrwUpload");
+EDEN_DIAGTRACE_GOLDEN(Config, "Config");
+EDEN_DIAGTRACE_GOLDEN(IdentitySnap, "IdentitySnap");
+EDEN_DIAGTRACE_GOLDEN(ImageDormant, "ImageDormant");
+EDEN_DIAGTRACE_GOLDEN(ImageUpload, "ImageUpload");
+EDEN_DIAGTRACE_GOLDEN(DrawBuf, "DrawBuf");
+#undef EDEN_DIAGTRACE_GOLDEN
 inline const char* ClsName(u32 cls) {
     return cls < kClsNames.size() ? kClsNames[cls] : "Unknown";
 }
