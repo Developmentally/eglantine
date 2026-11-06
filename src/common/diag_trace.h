@@ -77,7 +77,14 @@ enum class Ev : u8 {
                      // (generation is in c here, but in d on ViewErase - read the right field)
     ViewCacheHit,    // a=view_slot b=image_trace_obj c=view_slot_generation
     ViewErase,       // a=view_slot d=erased generation (0 = unknown/cap-skipped, not "gen 0")
-    Draw,            // a=draw_seq b=vertex_count c=instance_count d=indexed (in record lambda)
+    Draw,            // a=draw_seq b/c/d per d-kind (in record lambda):
+                     //   d=0 plain non-indexed (b=vertices c=instances)
+                     //   d=1 plain indexed     (b=vertices c=instances)
+                     //   d=2 compute dispatch  (b=dim.x c=dim.y<<32|dim.z)
+                     //   d=3 mesh tasks        (b=groups c=1)
+                     //   d=4 indirect byte-count (b=0 c=0)
+                     //   d=5 indirect with count buffer (b=max_draws c=stride)
+                     //   d=6 indirect          (b=max_draws c=stride)
     DrawSkip,        // a=draw_seq tag=reason
     DescFinal,       // a=draw_seq b=ORIGINAL image_trace_obj (kept on substitution) c=view_slot d=final VkImageView handle; tag f=final kind k/n/o
                      // tag=stage/ordinal/type/substitution-reason
@@ -100,6 +107,15 @@ enum class Ev : u8 {
                      // callers), join-resize/join-shrink[-msaa] (direct runtime
                      // calls in the join), blit (TextureCache::BlitImage issue
                      // point). CopyImageMSAA outside the join is NOT covered
+    DrawBuf,         // a=draw_seq (0 = bind outside a draw scope) b=device_addr c=size
+                     // d=write epoch at bind time (same per-page summed epoch source as
+                     // BufEpoch's a) tag=kind: index / vertex<slot>. Vertex emits fire
+                     // when the binding is queued into the bind batch; every queued
+                     // binding is bound by the end of that call. BINDS ARE CACHED: a
+                     // draw with no DrawBuf line for a slot reuses the last bound
+                     // buffer - correlate with the BufEpoch stream for writes landing
+                     // after the bind. Coverage: index + vertex binds only (uniform,
+                     // storage and indirect-argument buffers are NOT covered)
     BufEpoch,        // a=write_epoch b=device_addr c=size
     HrwSeed,         // a=core b=page c=address d=size
     HrwSkip,         // a=core b=page c=address d=size (shortcut hit, OnCPUWrite not called)
@@ -146,6 +162,8 @@ enum class Ev : u8 {
                      //                read it as a new defect or as the user's cause
                      //   -missing     no diag record at completion
                      //   -unknown     a=0, nothing to re-check against
+                     // The suffixes are observed only when a completion is reached; an
+                     // unfinished decode/unswizzle produces NO event at all
                      // ISSUE/QUEUE ONLY, never GPU completion. Presence proves an upload
                      // was ISSUED at that frame; ABSENCE DOES NOT prove never
                      // guest-populated (pre-window, dropped events, observer/backend

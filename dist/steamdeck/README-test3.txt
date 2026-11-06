@@ -24,11 +24,14 @@ STEP 1 - seed the diagnostic settings from your ACTUAL working settings:
   build rewrites its own ini at every launch, so yours may differ. Seed the
   diagnostic settings from your working build BEFORE the first launch:
     ./eglantine-test3.sh --seed-from "<working build folder>/eglantine-deck.ini"
-  This byte-copies the file and writes a receipt (source path, both hashes,
-  time) into eglantine-test3-sessions.log. The launcher REFUSES to run until
-  a seed receipt exists - there is no bypass. (To run with the packaged
-  default on purpose, seed from this folder's eglantine-deck.ini; the
-  receipt records that choice.)
+  This atomically byte-copies the file (temp + rename; a symlinked or busy
+  target is replaced, never written through, and a failed seed leaves the
+  old file untouched) and records a receipt (source path, both hashes) in
+  eglantine-test3-sessions.log plus the eglantine-test3.seeded marker. The
+  launcher REFUSES to run until the marker exists, and also refuses if
+  eglantine-test3.ini is a symlink - there is no bypass. (To run with the
+  packaged default on purpose, seed from this folder's eglantine-deck.ini;
+  the receipt records that choice.)
 
 STEP 2 - launch (Desktop Mode first):
   1. Make the AppImage executable: Properties -> Permissions -> "Is executable".
@@ -57,7 +60,14 @@ Limits you will hit on purpose:
     value could point at your working ini, which must never be rewritten.
   - After the first run the build rewrites eglantine-test3.ini at startup, so
     the seed receipt's hash documents the SEEDED state, not the current one.
+    Each session records the settings hash before startup and after exit, so
+    a diff against the receipt is the startup normalization, not tampering.
     Re-seed (same command) whenever your working settings change.
+  - The session log carries two env records per run: the launcher's own
+    pre-launch line, then the standard launcher's "eglantine-deck:" line with
+    the FINAL effective env (it applies its own defaults, e.g. AUTO_STUB).
+  - A literal -- argument and a user --appimage are REFUSED (the launcher
+    owns the binary choice and the argument shape).
   - The capture window defaults to everything. Instinct may ask you to set
     EDEN_NX2_TRACE_FROM_FRAME / EDEN_NX2_TRACE_TO_FRAME / EDEN_NX2_TRACE_DRAWS
     for a focused capture.

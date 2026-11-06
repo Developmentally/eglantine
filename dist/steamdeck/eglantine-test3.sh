@@ -31,26 +31,42 @@ if [ -n "${EGLANTINE_SETTINGS:-}" ]; then
 fi
 export EGLANTINE_SETTINGS="$here/eglantine-test3.ini"
 [ -f "$EGLANTINE_SETTINGS" ] || die "settings file $EGLANTINE_SETTINGS is missing; it comes with this kit"
+receipt="$here/eglantine-test3.seeded"
 
-# Explicit seed action: byte-copy the given working ini over the kit's
-# diagnostic ini and write a receipt. This is the ONLY way to seed - no
-# path guessing, no equality heuristics. Seeding from the kit's own packaged
-# default is allowed and recorded as such (a deliberate choice).
+# Explicit seed action: atomically byte-copy the given working ini over the
+# kit's diagnostic ini (temp file + rename, so a symlinked or busy dest is
+# replaced, never written through, and a failed seed never truncates it) and
+# record a receipt. The receipt marker is REMOVED first and rewritten only
+# after the copy completes - an interrupted seed leaves no marker and the
+# launcher stays fail-closed. No path guessing, no equality heuristics.
+# Seeding from the kit's own packaged default is allowed and recorded as
+# such (a deliberate choice).
 if [ "${1:-}" = "--seed-from" ]; then
-    src="${2:-}"
-    [ -n "$src" ] || die "--seed-from needs the path to your working eglantine-deck.ini"
+    [ $# -eq 2 ] || die "--seed-from takes exactly one argument: the path to your working eglantine-deck.ini"
+    src="$2"
     [ -f "$src" ] || die "seed source $src does not exist or is not a file"
-    cp -- "$src" "$EGLANTINE_SETTINGS" || die "seed copy from $src failed"
+    tmp="$here/.eglantine-test3.ini.tmp.$$"
+    rm -f "$receipt"
+    if ! cp -- "$src" "$tmp" || ! mv -f -- "$tmp" "$EGLANTINE_SETTINGS"; then
+        rm -f "$tmp"
+        die "seed copy from $src failed; the previous settings file is untouched and the seed marker is cleared - seed again before running"
+    fi
     src_hash="$(sha256sum "$src" | cut -d' ' -f1)"
     dst_hash="$(sha256sum "$EGLANTINE_SETTINGS" | cut -d' ' -f1)"
-    echo "eglantine-test3: seeded settings from '$src' src-sha256=$src_hash dst-sha256=$dst_hash" | tee -a "$sessions" >&2
+    echo "eglantine-test3: seeded settings from '$src' src-sha256=$src_hash dst-sha256=$dst_hash" | tee -a "$sessions" > "$receipt"
+    cat "$receipt" >&2
     exit 0
 fi
 
-# Fail-closed: refuse to run until an explicit seed receipt exists.
-if ! grep -q '^eglantine-test3: seeded settings from ' "$sessions" 2>/dev/null; then
-    die "settings not seeded yet. Run: ./eglantine-test3.sh --seed-from <path to your working eglantine-deck.ini> (see README-test3.txt)"
-fi
+# Fail-closed: refuse to run until an explicit seed receipt marker exists.
+[ -f "$receipt" ] || die "settings not seeded yet. Run: ./eglantine-test3.sh --seed-from <path to your working eglantine-deck.ini> (see README-test3.txt)"
+# Run-time guard: a symlinked OR hardlinked settings file would make the
+# build's startup rewrite write through to whatever shares the inode
+# (possibly the working ini). Refuse; reseed to fix. (The seed's temp+rename
+# always installs a fresh, singly-linked regular file.)
+[ ! -L "$EGLANTINE_SETTINGS" ] || die "eglantine-test3.ini is a symlink - the build rewrites its settings and would write through the link. Run the --seed-from step to replace it with a real copy."
+[ "$(stat -c %h "$EGLANTINE_SETTINGS")" -eq 1 ] || die "eglantine-test3.ini has more than one hard link - the build rewrites its settings and would write through the link. Run the --seed-from step to install a fresh copy."
+
 
 # Chunk-batch refusals: env var, explicit flag, and the standard launcher's
 # folder-name auto-default (it would turn chunk-batch on AFTER these checks).
@@ -68,7 +84,7 @@ while [ ${#remaining[@]} -gt 0 ]; do
     case "${remaining[0]}" in
     --frames-ahead|--chunk-batch|--no-mesh|--windowed) remaining=("${remaining[@]:1}") ;;
     --appimage) die "--appimage is owned by this launcher (it selects 'eglantine test 3.AppImage'); passing your own would silently run a different binary" ;;
-    --) break ;;
+    --) die "a literal -- is unsupported by this launcher; pass the game folder and known switches only" ;;
     -*) remaining=("${remaining[@]:1}") ;;
     *) [ -z "$game" ] && game="${remaining[0]}"; remaining=("${remaining[@]:1}") ;;
     esac
@@ -102,7 +118,10 @@ ini_hash_before="$(sha256sum "$EGLANTINE_SETTINGS" | cut -d' ' -f1)"
 effective_env="$(env | grep '^EDEN_NX2_' | sort | tr '\n' ' ')"
 echo "eglantine-test3: diagnostic capture (evidence only, not a fix); settings=$(basename "$EGLANTINE_SETTINGS") sha256-before=$ini_hash_before env: $effective_env" | tee -a "$sessions" >&2
 
-"$here/eglantine-deck.sh" --appimage "$appimage" "$@"
+# deck.sh applies its own defaults AFTER the wrapper's record above (e.g.
+# EDEN_NX2_AUTO_STUB=1, --frames-ahead -> EDEN_NX2_FRAMES_AHEAD=a) and echoes
+# the final effective env to stderr - capture that stderr durably too.
+"$here/eglantine-deck.sh" --appimage "$appimage" "$@" 2> >(tee -a "$sessions" >&2)
 rc=$?
 ini_hash_after="$(sha256sum "$EGLANTINE_SETTINGS" | cut -d' ' -f1)"
 echo "eglantine-test3: session ended rc=$rc settings-sha256 before=$ini_hash_before after=$ini_hash_after" | tee -a "$sessions" >&2

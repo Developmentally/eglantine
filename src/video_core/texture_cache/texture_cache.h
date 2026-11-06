@@ -2290,18 +2290,22 @@ void TextureCache<P>::TickAsyncDecode() {
                     async_decode->decoded_data.size());
         image.UploadMemory(staging, async_decode->copies);
         image.flags &= ~ImageFlagBits::IsDecoding;
-        const char* up_tag; // diag: re-check the queue-time identity against the record
+        const char* up_tag; // diag: re-check the queue-time identity against the record.
+                            // Order is load-bearing: object identity BEFORE record state,
+                            // so -erased only ever names the QUEUED object erased with its
+                            // slot unreused (a different occupant - whatever its state -
+                            // is -superseded)
         if (async_decode->trace_obj == 0) {
             up_tag = "async-decode-unknown";
         } else if (DiagImageStateOf(async_decode->image_id) < 0) {
-            up_tag = "async-decode-missing";
-        } else if (DiagImageStateOf(async_decode->image_id) == 1) {
-            up_tag = "async-decode-erased"; // guard: cancelled should have dropped it;
-                                            // if this fires, the cancel path missed
+            up_tag = "async-decode-missing"; // guard: records are never removed
         } else if (DiagTraceObjOf(async_decode->image_id) != async_decode->trace_obj) {
-            up_tag = "async-decode-superseded";
+            up_tag = "async-decode-superseded"; // guard: cancelled should have dropped it;
+                                                // if this fires, the cancel path missed
+        } else if (DiagImageStateOf(async_decode->image_id) == 1) {
+            up_tag = "async-decode-erased";
         } else {
-            up_tag = "async-decode";
+            up_tag = "async-decode"; // includes dormant: same object, valid upload target
         }
         Common::DiagTrace::Emit(Common::DiagTrace::Ev::ImageUpload, frame_tick,
                                 async_decode->trace_obj, 0, 0, 0, up_tag);
@@ -2383,16 +2387,19 @@ void TextureCache<P>::TickAsyncUnswizzle() {
     if (is_final_batch && all_slices_submitted) {
         runtime.FreeDeferredStagingBuffer(task.staging_buffer);
         image.flags &= ~ImageFlagBits::IsDecoding;
-        const char* up_tag; // diag: re-check the queue-time identity against the record
+        const char* up_tag; // diag: re-check the queue-time identity against the record.
+                            // Order is load-bearing: object identity BEFORE record state
+                            // (a later occupant that was itself deleted must NOT read as
+                            // the queued object being erased)
         if (task.trace_obj == 0) {
             up_tag = "unswizzle-submitted-unknown";
         } else if (DiagImageStateOf(task.image_id) < 0) {
-            up_tag = "unswizzle-submitted-missing";
+            up_tag = "unswizzle-submitted-missing"; // guard: records are never removed
+        } else if (DiagTraceObjOf(task.image_id) != task.trace_obj) {
+            up_tag = "unswizzle-submitted-superseded";
         } else if (DiagImageStateOf(task.image_id) == 1) {
             up_tag = "unswizzle-submitted-erased"; // pre-existing hazard: DeleteImage
                                                    // never touches unswizzle_queue
-        } else if (DiagTraceObjOf(task.image_id) != task.trace_obj) {
-            up_tag = "unswizzle-submitted-superseded";
         } else {
             up_tag = "unswizzle-submitted"; // final batch ISSUED, not GPU-complete
         }

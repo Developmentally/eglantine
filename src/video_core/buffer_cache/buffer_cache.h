@@ -7,6 +7,7 @@
 #pragma once
 
 #include <algorithm>
+#include <cstdio>
 #include <memory>
 #include <numeric>
 #include <stdexcept>
@@ -853,6 +854,10 @@ void BufferCache<P>::BindHostIndexBuffer() {
         buffer.MarkUsage(offset, size);
         runtime.BindIndexBuffer(draw_state.topology, draw_state.index_buffer.format, draw_state.index_buffer.first, draw_state.index_buffer.count, buffer, offset, size);
     }
+    Common::DiagTrace::Emit(Common::DiagTrace::Ev::DrawBuf, Common::DiagTrace::CurrentFrame(),
+                            Common::DiagTrace::tl_draw_seq, channel_state->index_buffer.device_addr,
+                            size, WriteEpoch(channel_state->index_buffer.device_addr, size),
+                            "index");
 }
 
 template <class P>
@@ -939,6 +944,15 @@ void BufferCache<P>::BindHostVertexBuffers() {
             bindings.offsets.push_back(offset);
             bindings.sizes.push_back(binding.size);
             bindings.strides.push_back(stride);
+            {
+                char tag[48]; // diag: queued into the batch this call binds
+                std::snprintf(tag, sizeof(tag), "vertex%u", index);
+                Common::DiagTrace::Emit(Common::DiagTrace::Ev::DrawBuf,
+                                        Common::DiagTrace::CurrentFrame(),
+                                        Common::DiagTrace::tl_draw_seq, binding.device_addr,
+                                        binding.size, WriteEpoch(binding.device_addr, binding.size),
+                                        tag);
+            }
             last_index = index;
         }
         flush_bindings();
@@ -977,6 +991,15 @@ void BufferCache<P>::BindHostVertexBuffers() {
                 host_bindings.offsets.push_back(offset);
                 host_bindings.sizes.push_back(binding.size);
                 host_bindings.strides.push_back(stride);
+                {
+                    char tag[48]; // diag: queued into the batch bound below
+                    std::snprintf(tag, sizeof(tag), "vertex%u", index);
+                    Common::DiagTrace::Emit(Common::DiagTrace::Ev::DrawBuf,
+                                            Common::DiagTrace::CurrentFrame(),
+                                            Common::DiagTrace::tl_draw_seq, binding.device_addr,
+                                            binding.size, WriteEpoch(binding.device_addr, binding.size),
+                                            tag);
+                }
             }
             runtime.BindVertexBuffers(host_bindings);
         }

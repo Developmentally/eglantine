@@ -263,16 +263,16 @@ public:
         return it != diag_images_.end() ? it->second.trace_obj : 0;
     }
 
-    // D2: address space id recorded at insert (0 = untracked).
-    // Encoded for tags: returns MemoryManager id + 1, so 0 unambiguously means
-    // "untracked" (manager ids start at 0 - memory_manager.cpp fetch_add - so a
-    // raw id of 0 is the valid first address space).
     // Diag record state for completion identity re-checks:
     // -1 = no record, else 0=live 1=deleted 2=dormant.
     s64 DiagImageStateOf(ImageId image_id) const {
         const auto it = diag_images_.find(image_id.index);
         return it != diag_images_.end() ? static_cast<s64>(it->second.state) : -1;
     }
+    // D2: address space id recorded at insert (0 = untracked).
+    // Encoded for tags: returns MemoryManager id + 1, so 0 unambiguously means
+    // "untracked" (manager ids start at 0 - memory_manager.cpp fetch_add - so a
+    // raw id of 0 is the valid first address space).
     u64 DiagAsidOf(ImageId image_id) const {
         const auto it = diag_images_.find(image_id.index);
         return it != diag_images_.end() ? it->second.asid + 1 : 0;
