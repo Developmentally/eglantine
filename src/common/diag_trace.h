@@ -407,6 +407,20 @@ inline void Emit(Ev cls, u64 frame, u64 a, u64 b, u64 c, u64 d, const char* tag 
     }
 }
 
+// The rasterizer's draw-skip diagnostic emission, expression and all. Kept
+// as one small function so the component fixture can execute the REAL
+// production code (including a real std::bad_alloc from the std::string
+// temporary) instead of testing a copy of the pattern. The tag temporary is
+// built INSIDE Observe: only when tracing is enabled, and a throwing
+// construction is contained and counted in observer_errors instead of
+// escaping into the draw path.
+inline void EmitDrawSkipReason(u64 frame, u64 draw_seq, std::string_view reason) noexcept {
+    Observe([&] {
+        Emit(Ev::DrawSkip, frame, draw_seq, 0, 0, 0, std::string(reason).c_str());
+    });
+}
+
+
 // Precondition: the caller (Emit) already established Enabled(). Called only
 // inside Emit's try region.
 inline void EmitImpl(Ev cls, u64 frame, u64 a, u64 b, u64 c, u64 d, const char* tag) {

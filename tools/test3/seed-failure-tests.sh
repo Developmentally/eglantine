@@ -54,6 +54,13 @@
 #                            gate (recorded end-state branch) - guards over-refusal
 #  21 log loss:              sessions log deleted, or the receipt line truncated out,
 #                            after a real seed -> launch refuses (re-seed recovers)
+#  22 stale-marker matrix:   with a VALID marker already installed, each injected
+#                            reseed failure (src/dst hash failure, hash
+#                            output-then-nonzero, hash mismatch, partial publish)
+#                            leaves NO marker and launch refuses. (Distinct
+#                            disclosed limit: if the filesystem refuses to DELETE
+#                            the old marker at all, the last-good marker survives
+#                            by design - case 13.)
 set -u
 # The injected permission failures (chmod 555/444/000) only bind a NON-ROOT
 # user; running this harness as root would make them silently ineffective.
@@ -64,8 +71,11 @@ WORK=$(mktemp -d /tmp/seed-fail-test.XXXXXX)
 trap 'chmod -R u+w "$WORK" 2>/dev/null; rm -rf "$WORK"' EXIT
 fails=0
 
-note() { echo "--- $*"; }
+ncases=0
+note() { case "$1" in CASE*) ncases=$((ncases+1));; esac; echo "--- $*"; }
+nchecks=0
 expect() { # desc actual expected
+  nchecks=$((nchecks+1))
   if [ "$2" = "$3" ]; then echo "  OK: $1"; else echo "  FAIL: $1 (expected [$3], got [$2])"; fails=$((fails+1)); fi
 }
 
@@ -327,6 +337,35 @@ out=$("$D/eglantine-test3.sh" 2>&1); rc=$?
 expect "launch refuses after receipt truncated out (rc 1)" "$rc" "1"
 expect "no capture started (truncated)" "$(echo "$out" | grep -c 'diagnostic capture')" "0"
 
+note "CASE 22 stale VALID marker + injected reseed failure (Marcelo's criterion:"
+#       "no failed hash/evidence write may leave a launch-authorizing receipt")
+stale_case() { # name stubmode|printf-inject
+  local name="$1" mode="$2"
+  local D="$WORK/c22-$name"; mk_kit "$D"
+  "$D/eglantine-test3.sh" --seed-from "$SRCINI" >/dev/null 2>&1
+  expect "[$name] initial valid marker" "$([ -f "$D/eglantine-test3.seeded" ] && echo yes || echo no)" "yes"
+  local out rc
+  case "$mode" in
+    printf-inject)
+      out=$(env 'BASH_FUNC_printf%%=() { if [[ $(readlink /proc/$$/fd/1) == *eglantine-test3.seeded* ]]; then builtin printf partial; return 1; else builtin printf "$@"; fi; }' "$D/eglantine-test3.sh" --seed-from "$SRCINI" 2>&1); rc=$?;;
+    *)
+      mk_stub "$WORK/c22bin-$name" "$mode"
+      out=$(PATH="$WORK/c22bin-$name:$PATH" "$D/eglantine-test3.sh" --seed-from "$SRCINI" 2>&1); rc=$?;;
+  esac
+  [ "$rc" = 0 ] && rc=ok0 || rc=nonzero
+  expect "[$name] reseed rc nonzero" "$rc" "nonzero"
+  expect "[$name] marker GONE (no launch-authorizing receipt)" "$([ -f "$D/eglantine-test3.seeded" ] && echo yes || echo no)" "no"
+  out=$("$D/eglantine-test3.sh" 2>&1); rc=$?
+  expect "[$name] launch refuses" "$rc" "1"
+  expect "[$name] refusal names invalid marker" "$(echo "$out" | grep -c 'no valid seed receipt marker')" "1"
+  expect "[$name] no capture started" "$(echo "$out" | grep -c 'diagnostic capture')" "0"
+}
+stale_case src-hash-fail fail-src
+stale_case dst-hash-fail fail-dst
+stale_case hash-output-nonzero output-then-fail
+stale_case hash-mismatch lie-dst
+stale_case partial-publish printf-inject
+
 note "CASE 19 config changed outside the recorded flow"
 D="$WORK/c19"; mk_kit "$D"
 "$D/eglantine-test3.sh" --seed-from "$SRCINI" >/dev/null 2>&1
@@ -352,10 +391,9 @@ out=$("$D/eglantine-test3.sh" "$D/MKW" 2>&1); rc=$?
 expect "launch 2 passes gate via recorded end-state (rc 1 from dummy)" "$rc" "1"
 expect "launch 2 capture started" "$(echo "$out" | grep -c 'diagnostic capture')" "1"
 
-ncases=$(grep -c '^--- CASE ' "$0" 2>/dev/null || echo '?')
 echo ""
 if [ "$fails" = 0 ]; then
-  echo "SEED FAILURE-INJECTION: all expectations met ($ncases case groups run)"
+  echo "SEED FAILURE-INJECTION: all expectations met ($ncases case groups, $nchecks expectations)"
 else
   echo "SEED FAILURE-INJECTION: $fails expectation(s) FAILED"
   exit 1

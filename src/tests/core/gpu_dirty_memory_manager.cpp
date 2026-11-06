@@ -8,7 +8,12 @@
 // covered by runtime trace lines in the diagnostic build, not by this test.
 
 #include <algorithm>
+#include <atomic>
+#include <cstdlib>
 #include <functional>
+#include <new>
+#include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -17,6 +22,35 @@
 #include "common/common_types.h"
 #include "common/diag_trace.h"
 #include "core/gpu_dirty_memory_manager.h"
+
+// Allocation-failure injection for the REAL production emission helper tests
+// (C1/C2 below): replace the process-wide replaceable allocation functions so
+// the next N heap allocations throw std::bad_alloc for real, then auto-disarm
+// (arm-next-N). The fault is scoped to exactly the diagnostic's allocation:
+// the original failure-handling code that follows allocates too, and a
+// blanket "all allocations fail" arm would break it for reasons unrelated to
+// the diagnostic. These tests therefore do NOT claim survival under general
+// memory exhaustion - the original code's own allocation failing is
+// pre-existing d551 behavior, outside this correction's scope. Catch2 runs
+// this binary single-threaded.
+namespace {
+std::atomic<long> g_alloc_attempts{0};
+std::atomic<long> g_alloc_fail_next{0};
+} // namespace
+
+void* operator new(std::size_t n) {
+    g_alloc_attempts.fetch_add(1, std::memory_order_relaxed);
+    if (g_alloc_fail_next.load(std::memory_order_relaxed) > 0) {
+        g_alloc_fail_next.fetch_sub(1, std::memory_order_relaxed);
+        throw std::bad_alloc();
+    }
+    if (void* p = std::malloc(n)) {
+        return p;
+    }
+    throw std::bad_alloc();
+}
+void operator delete(void* p) noexcept { std::free(p); }
+void operator delete(void* p, std::size_t) noexcept { std::free(p); }
 
 namespace {
 
@@ -716,6 +750,83 @@ TEST_CASE("DiagTrace boundary B2: a fault before Emit is contained, counted, and
     });
     REQUIRE(DT::S().observer_errors.load() - err0 == 1); // contained + counted
     REQUIRE(DT::S().emitted[static_cast<size_t>(Ev::DrawSkip)].load() == em0); // no partial event
+}
+
+// r37 (Marcelo's acceptance list): execute the REAL production emission
+// helper the rasterizer's report_failure now calls - not a copy of the
+// pattern - under REAL allocation failure from a replaced global operator
+// new. Remaining boundary, stated plainly: the PrepareDraw call sites that
+// invoke report_failure are NOT executed (they need a live Vulkan renderer;
+// CI compiles that TU), and the report_failure -> EmitDrawSkipReason wiring
+// is source-reviewed, not executed. Reason literals are the actual >=16-char
+// call-site strings, so the std::string temporary really heap-allocates
+// under libstdc++ (SSO 15).
+TEST_CASE("DrawSkip production helper C1: disabled tracing builds no tag and allocates nothing",
+          "[trace-off]") {
+    DT::Enabled(); // warm any one-time latch so the measurement window is clean
+    const long a0 = g_alloc_attempts.load();
+    const u64 err0 = DT::S().observer_errors.load();
+    const u64 em0 = DT::S().emitted[static_cast<size_t>(DT::Ev::DrawSkip)].load();
+    const std::string_view reason = "no VK_EXT_mesh_shader"; // 21 chars, would allocate
+    DT::EmitDrawSkipReason(42, 7, reason);                  // the exact production function
+    const bool original_handling_ran = true; // continuation after the call is uninterrupted
+    // Snapshot BEFORE any REQUIRE: Catch2's own assertion machinery allocates.
+    const long a1 = g_alloc_attempts.load();
+    const u64 err1 = DT::S().observer_errors.load();
+    const u64 em1 = DT::S().emitted[static_cast<size_t>(DT::Ev::DrawSkip)].load();
+    REQUIRE(original_handling_ran);
+    REQUIRE(a1 - a0 == 0); // tag never built while disabled
+    REQUIRE(err1 == err0);
+    REQUIRE(em1 == em0);
+}
+
+TEST_CASE("DrawSkip production helper C2: a real bad_alloc before Emit is contained and counted",
+          "[trace-on]") {
+    const std::string_view reason = "configure failed"; // 16 chars, heap-allocates
+    DT::EmitDrawSkipReason(41, 6, reason);              // warm-up unarmed (emits one event)
+    const u64 err0 = DT::S().observer_errors.load();
+    const u64 em0 = DT::S().emitted[static_cast<size_t>(DT::Ev::DrawSkip)].load();
+    const long a0 = g_alloc_attempts.load();
+    bool original_handling_ran = false;
+    g_alloc_fail_next.store(1); // ONLY the diagnostic temporary's allocation fails
+    DT::EmitDrawSkipReason(42, 7, reason); // must not throw: the function is noexcept
+    // Marcelo's criterion: the diagnostic failure must neither escape NOR
+    // prevent the original failure handling that follows the call (in
+    // production: the d551 logging/dedup path in report_failure). With the
+    // fault self-disarmed after that one allocation, the continuation runs
+    // under a normal allocator.
+    original_handling_ran = true;
+    // Snapshot BEFORE any REQUIRE: Catch2's own assertion machinery allocates.
+    const long a1 = g_alloc_attempts.load();
+    const long f1 = g_alloc_fail_next.load();
+    const u64 err1 = DT::S().observer_errors.load();
+    const u64 em1 = DT::S().emitted[static_cast<size_t>(DT::Ev::DrawSkip)].load();
+    REQUIRE(original_handling_ran);
+    REQUIRE(f1 == 0); // exactly one allocation consumed the fault
+    REQUIRE(a1 - a0 >= 1); // the temporary really tried to allocate
+    REQUIRE(err1 - err0 == 1); // contained + counted
+    REQUIRE(em1 == em0); // no event
+}
+
+TEST_CASE("DrawSkip r32 shape negative control: the unwrapped temporary escapes into the caller",
+          "[trace-on]") {
+    // The r32 expression shape: Emit(..., std::string(reason).c_str()) with NO
+    // Observe wrapper. With the allocator armed, the temporary's bad_alloc
+    // propagates out of the expression - the friend's reported gap, executed
+    // here as the control that proves C2's containment is real.
+    const std::string_view reason = "EDEN_NX2_NO_MESH"; // 16 chars, heap-allocates
+    bool escaped = false;
+    bool original_handling_ran = false;
+    g_alloc_fail_next.store(1);
+    try {
+        DT::Emit(DT::Ev::DrawSkip, DT::CurrentFrame(), 0, 0, 0, 0, std::string(reason).c_str());
+        original_handling_ran = true; // what follows the unwrapped diagnostic
+    } catch (const std::bad_alloc&) {
+        escaped = true;
+    }
+    REQUIRE(g_alloc_fail_next.load() == 0); // the fault fired
+    REQUIRE(escaped); // r32 shape leaks the fault; the production helper must not (C2)
+    REQUIRE(!original_handling_ran); // and it skips the continuation entirely
 }
 
 TEST_CASE("DiagTrace isolation T6: disabled trace never consults the hook", "[trace-off]") {
