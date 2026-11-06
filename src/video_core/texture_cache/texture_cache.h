@@ -187,7 +187,7 @@ void TextureCache<P>::RunGarbageCollector() {
         }
         ++(True(image.flags & ImageFlagBits::CostlyLoad) ? gc_costly_deletes : gc_deletes);
         UnregisterImage(image_id);
-        DeleteImage(image_id, image.scale_tick > frame_tick + 5);
+        DeleteImage(image_id, image.scale_tick > frame_tick + 5, "collector");
         if (aggressive_mode && total_used_memory < critical_memory) {
             num_iterations >>= 2;
             aggressive_mode = false;
@@ -258,7 +258,7 @@ void TextureCache<P>::RetryUnbackedImages() {
             }
             // UnregisterImage removes the id from unbacked_image_ids, so i stays.
             UnregisterImage(image_id);
-            DeleteImage(image_id, false);
+            DeleteImage(image_id, false, "retry");
             ++retried;
         }
     }
@@ -1204,7 +1204,7 @@ void TextureCache<P>::UnmapMemory(DAddr cpu_addr, size_t size) {
             UntrackImage(image, id);
         }
         UnregisterImage(id);
-        DeleteImage(id);
+        DeleteImage(id, false, "unmap");
     }
 }
 
@@ -2522,9 +2522,24 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
             dit->second.state = 0;
             ++dit->second.generation;
             diag_trace_obj = dit->second.trace_obj;
+            // ReviveDormantImage matches on gpu/cpu addr + shape only, NOT on
+            // address space. Disclose the observed current asid and, when it
+            // differs from the creation-time record, update the association
+            // and say so (production revive policy unchanged).
+            char diag_revive_tag[64];
+            if (dit->second.asid != diag_asid) {
+                std::snprintf(diag_revive_tag, sizeof(diag_revive_tag),
+                              "same-object as%llx was%llx",
+                              (unsigned long long)(diag_asid + 1),
+                              (unsigned long long)(dit->second.asid + 1));
+                dit->second.asid = diag_asid;
+            } else {
+                std::snprintf(diag_revive_tag, sizeof(diag_revive_tag), "same-object as%llx",
+                              (unsigned long long)(diag_asid + 1));
+            }
             Common::DiagTrace::Emit(Common::DiagTrace::Ev::ImageRevive, frame_tick,
                                     diag_trace_obj, new_image_id.index, gpu_addr,
-                                    dit->second.generation, "same-object");
+                                    dit->second.generation, diag_revive_tag);
         } else {
             diag_trace_obj =
                 Common::DiagTrace::S().next_obj_id.fetch_add(1, std::memory_order_relaxed);
@@ -2604,7 +2619,7 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
                                     dit->second.trace_obj, diag_trace_obj, overlap.gpu_addr, 0,
                                     diag_evict_tag);
         }
-        DeleteImage(overlap_id);
+        DeleteImage(overlap_id, false, "join-overlap");
     }
 
     // TODO: Only upload what we need
@@ -2717,10 +2732,23 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
             UntrackImage(overlap, copy_object.id);
         }
         UnregisterImage(copy_object.id);
+        // D4: join-copy replacement edge (eviction relation, NOT proven same
+        // semantic object) for both the resize->dormant and the delete route.
+        // Tag is a fixed string + 16 hex chars, bounded by construction.
+        if (const auto dit = diag_images_.find(copy_object.id.index);
+            dit != diag_images_.end()) {
+            char diag_evict_tag[48];
+            std::snprintf(diag_evict_tag, sizeof(diag_evict_tag), "%s as%llx",
+                          copy_object.resize ? "join-copy-resize-dormant" : "join-copy-delete",
+                          (unsigned long long)(dit->second.asid + 1));
+            Common::DiagTrace::Emit(Common::DiagTrace::Ev::RelatedEvict, frame_tick,
+                                    dit->second.trace_obj, diag_trace_obj,
+                                    dit->second.gpu_addr, 0, diag_evict_tag);
+        }
         if (copy_object.resize) {
             MakeDormant(copy_object.id);
         } else {
-            DeleteImage(copy_object.id);
+            DeleteImage(copy_object.id, false, "join-copy");
         }
     }
 
@@ -2773,7 +2801,9 @@ void TextureCache<P>::MakeDormant(ImageId image_id) {
     dormant_bytes += bytes;
     dormant_images[image.gpu_addr].push_back(DormantImage{image_id, frame_tick});
     // D3: dormant is a distinct recorded state (was indistinguishable from
-    // "live" in IdentitySnap). Same unguarded-find shape as DeleteImage.
+    // "live" in IdentitySnap). Same unguarded-find shape as DeleteImage:
+    // snprintf + Emit run only when a record exists, so it is fault-safe in
+    // the same way (no map mutation; node write cannot rehash).
     if (const auto dit = diag_images_.find(image_id.index); dit != diag_images_.end()) {
         char diag_dorm_tag[24];
         std::snprintf(diag_dorm_tag, sizeof(diag_dorm_tag), "as%llx",
@@ -2847,7 +2877,7 @@ void TextureCache<P>::EvictDormantImages() {
             const u64 bytes = Common::AlignUp(HostImageSizeBytes(image), 1024);
             dormant_bytes -= bytes;
             total_used_memory += bytes; // DeleteImage takes it off again
-            DeleteImage(dormant.id);
+            DeleteImage(dormant.id, false, "dormant-evict");
             return true;
         });
         candidates.erase(removed, candidates.end());
@@ -3526,7 +3556,8 @@ void TextureCache<P>::UntrackImage(ImageBase& image, ImageId image_id) {
 }
 
 template <class P>
-void TextureCache<P>::DeleteImage(ImageId image_id, bool immediate_delete) {
+void TextureCache<P>::DeleteImage(ImageId image_id, bool immediate_delete,
+                                  const char* diag_cause) {
     ImageBase& image = slot_images[image_id];
     ++images_deleted;
     if (Tegra::Nx2TracedDestination(image.gpu_addr, image.guest_size_bytes)) {
@@ -3666,9 +3697,19 @@ void TextureCache<P>::DeleteImage(ImageId image_id, bool immediate_delete) {
     if (const auto dit = diag_images_.find(image_id.index); dit != diag_images_.end()) {
         // Emitted at the actual slot-free point; address taken from the record because
         // the image may already be moved-from (sentenced).
-        char diag_erase_tag[24];
-        std::snprintf(diag_erase_tag, sizeof(diag_erase_tag), "as%llx",
-                      (unsigned long long)(dit->second.asid + 1));
+        // D5: c= caller-supplied cause; r= backing disposition - the slot is
+        // freed here, but sentenced/retained backing outlives this event.
+        char diag_erase_tag[72];
+        const int diag_erase_len = std::snprintf(
+            diag_erase_tag, sizeof(diag_erase_tag), "as%llx c=%s r=%s",
+            (unsigned long long)(dit->second.asid + 1), diag_cause,
+            retained          ? "retained"
+            : immediate_delete ? "immediate"
+                               : "sentenced");
+        if (diag_erase_len < 0 || static_cast<size_t>(diag_erase_len) >= sizeof(diag_erase_tag)) {
+            Common::DiagTrace::S().tag_truncated.fetch_add(1, std::memory_order_relaxed);
+            std::memcpy(diag_erase_tag + sizeof(diag_erase_tag) - 4, "~TR", 4);
+        }
         Common::DiagTrace::Emit(Common::DiagTrace::Ev::ImageErase, frame_tick,
                                 dit->second.trace_obj, image_id.index, dit->second.gpu_addr,
                                 dit->second.created_frame, diag_erase_tag);
@@ -3903,7 +3944,7 @@ bool TextureCache<P>::ReplaceUnwrittenSparseImage(ImageId image_id) {
         UntrackImage(image, image_id);
     }
     UnregisterImage(image_id);
-    DeleteImage(image_id);
+    DeleteImage(image_id, false, "replace-unwritten-sparse");
     return true;
 }
 

@@ -526,7 +526,9 @@ private:
     void UntrackImage(ImageBase& image, ImageId image_id);
 
     /// Delete image from the cache
-    void DeleteImage(ImageId image, bool immediate_delete = false);
+    // diag_cause: D5 evidence tag only (collector/retry/unmap/join-overlap/
+    // join-copy/dormant-evict/replace-unwritten-sparse); no behavior change.
+    void DeleteImage(ImageId image, bool immediate_delete = false, const char* diag_cause = "");
 
     /// Keep an unregistered render target for a later revival instead of deleting it
     void MakeDormant(ImageId image_id);
