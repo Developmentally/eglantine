@@ -21,12 +21,14 @@ Folder layout:
 
 STEP 1 - seed the diagnostic settings from your ACTUAL working settings:
   The packaged eglantine-test3.ini is only the fork's default. Your working
-  build rewrites its own ini at every launch, so yours may differ. Copy the
-  eglantine-deck.ini from your WORKING build folder over this folder's
-  eglantine-test3.ini BEFORE the first launch, so the diagnostic run uses
-  exactly the settings you actually play with. The launcher REFUSES to start
-  while eglantine-test3.ini still matches the packaged default; to run with
-  the default on purpose, set EGLANTINE_TEST3_ALLOW_DEFAULT_INI=1.
+  build rewrites its own ini at every launch, so yours may differ. Seed the
+  diagnostic settings from your working build BEFORE the first launch:
+    ./eglantine-test3.sh --seed-from "<working build folder>/eglantine-deck.ini"
+  This byte-copies the file and writes a receipt (source path, both hashes,
+  time) into eglantine-test3-sessions.log. The launcher REFUSES to run until
+  a seed receipt exists - there is no bypass. (To run with the packaged
+  default on purpose, seed from this folder's eglantine-deck.ini; the
+  receipt records that choice.)
 
 STEP 2 - launch (Desktop Mode first):
   1. Make the AppImage executable: Properties -> Permissions -> "Is executable".
@@ -53,6 +55,9 @@ Limits you will hit on purpose:
   - If EGLANTINE_SETTINGS is set in your environment, the launcher IGNORES it
     (loudly) and always uses this kit's eglantine-test3.ini - an inherited
     value could point at your working ini, which must never be rewritten.
+  - After the first run the build rewrites eglantine-test3.ini at startup, so
+    the seed receipt's hash documents the SEEDED state, not the current one.
+    Re-seed (same command) whenever your working settings change.
   - The capture window defaults to everything. Instinct may ask you to set
     EDEN_NX2_TRACE_FROM_FRAME / EDEN_NX2_TRACE_TO_FRAME / EDEN_NX2_TRACE_DRAWS
     for a focused capture.
