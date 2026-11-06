@@ -93,6 +93,10 @@ Limits you will hit on purpose:
     proves nothing).
   - A literal -- argument and a user --appimage are REFUSED (the launcher
     owns the binary choice and the argument shape).
+  - Run ONE session at a time: two simultaneous runs share eglantine-test3.ini
+    (the build rewrites it at startup) and the sessions log, and the settings
+    file could interleave-corrupt. The hash records would show the divergence,
+    but the settings themselves are not protected.
   - The capture window defaults to everything. Instinct may ask you to set
     EDEN_NX2_TRACE_FROM_FRAME / EDEN_NX2_TRACE_TO_FRAME / EDEN_NX2_TRACE_DRAWS
     for a focused capture.

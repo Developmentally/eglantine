@@ -136,16 +136,42 @@ deck_err="$here/.eglantine-test3-stderr.$sid"
 "$here/eglantine-deck.sh" --appimage "$appimage" "$@" 2> "$deck_err"
 rc=$?
 ini_hash_after="$(sha256sum "$EGLANTINE_SETTINGS" | cut -d' ' -f1)"
-if {
-    echo "eglantine-test3: [$sid] deck effective-env record (kept separate so it survives any run volume):"
-    grep '^eglantine-deck:' "$deck_err" || echo "eglantine-test3: [$sid] (no eglantine-deck: env line found in captured stderr)"
-    echo "eglantine-test3: [$sid] deck/app stderr follows (bounded to the LAST 131072 bytes; earlier output beyond that window is only in the temp file, which is removed after this append succeeds):"
-    tail -c 131072 "$deck_err"
-    echo "eglantine-test3: [$sid] end of deck/app stderr"
-} | tee -a "$sessions" >&2; then
+# Every required read/write is status-checked explicitly: a producer failure
+# (missing/unreadable temp, grep read error, tail failure) or a consumer
+# failure (tee/sessions log) keeps the FULL temp on disk - the only copy is
+# never deleted after an incomplete capture. grep no-match (rc 1) is a
+# truthful "no env line" note, NOT a failure; grep rc >=2 is a read error.
+append_ok=1
+if [ ! -r "$deck_err" ]; then
+    echo "eglantine-test3: [$sid] WARNING: stderr temp $deck_err missing or unreadable before append; nothing captured" | tee -a "$sessions" >&2
+    append_ok=0
+else
+    {
+        echo "eglantine-test3: [$sid] deck effective-env record (kept separate so it survives any run volume):"
+        total_bytes=$(wc -c < "$deck_err") || { echo "eglantine-test3: [$sid] WARNING: wc failed on stderr temp"; exit 5; }
+        grep -a '^eglantine-deck:' "$deck_err"; grc=$?
+        if [ $grc -ge 2 ]; then
+            echo "eglantine-test3: [$sid] WARNING: grep read error (rc=$grc) on stderr temp"
+            exit 3
+        fi
+        [ $grc -eq 0 ] || echo "eglantine-test3: [$sid] (no eglantine-deck: env line found in captured stderr)"
+        if [ "$total_bytes" -gt 131072 ]; then
+            echo "eglantine-test3: [$sid] deck/app stderr follows (LAST 131072 bytes of $total_bytes total; $((total_bytes-131072)) earlier bytes are only in the temp file, which is removed after this append succeeds):"
+        else
+            echo "eglantine-test3: [$sid] deck/app stderr follows ($total_bytes bytes, complete):"
+        fi
+        tail -c 131072 "$deck_err" || { echo "eglantine-test3: [$sid] WARNING: tail failed (rc=$?) on stderr temp"; exit 4; }
+        echo "eglantine-test3: [$sid] end of deck/app stderr"
+    } | tee -a "$sessions" >&2
+    ps=("${PIPESTATUS[@]}")
+    if [ "${ps[0]}" != 0 ] || [ "${ps[1]}" != 0 ]; then
+        append_ok=0
+    fi
+fi
+if [ $append_ok = 1 ]; then
     rm -f "$deck_err"
 else
-    echo "eglantine-test3: [$sid] WARNING: sessions-log append FAILED; FULL stderr retained at $deck_err - send that file too" | tee -a "$sessions" >&2
+    echo "eglantine-test3: [$sid] WARNING: sessions-log append FAILED or incomplete; FULL stderr retained at $deck_err - send that file too" | tee -a "$sessions" >&2
 fi
 echo "eglantine-test3: [$sid] session ended rc=$rc settings-sha256 before=$ini_hash_before after=$ini_hash_after" | tee -a "$sessions" >&2
 exit $rc
