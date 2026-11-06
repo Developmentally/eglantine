@@ -66,7 +66,10 @@ TextureCache<P>::TextureCache(Runtime& runtime_, Tegra::MaxwellDeviceMemoryManag
     // Make sure the first index is reserved for the null resources
     // This way the null resource becomes a compile time constant
     void(slot_images.insert(NullImageParams{}));
-    void(slot_image_views.insert(runtime, NullImageViewParams{}));
+    const ImageViewId null_view_id = slot_image_views.insert(runtime, NullImageViewParams{});
+    // D6b: the null view gets a tracked generation too, so DiagViewGenOf can
+    // never read a previous occupant's gen for this slot.
+    Common::DiagTrace::Observe([&] { diag_view_gen_[null_view_id.index] = 1; });
     void(slot_samplers.insert(runtime, sampler_descriptor));
 
     if constexpr (HAS_DEVICE_MEMORY_INFO) {
@@ -1940,7 +1943,18 @@ ImageViewId TextureCache<P>::CreateImageView(const TICEntry& raw_config) {
     const ImageInfo info(config);
     if (info.type == ImageType::Buffer) {
         const ImageViewInfo view_info(config, 0);
-        return slot_image_views.insert(runtime, info, view_info, config.Address());
+        const ImageViewId buffer_view_id =
+            slot_image_views.insert(runtime, info, view_info, config.Address());
+        // D6b: every slot_image_views insert sets a generation (fault-contained).
+        Common::DiagTrace::Observe([&] {
+            if (diag_view_gen_.size() < 262144 ||
+                diag_view_gen_.contains(buffer_view_id.index)) {
+                ++diag_view_gen_[buffer_view_id.index];
+            } else {
+                ++diag_view_gen_skipped;
+            }
+        });
+        return buffer_view_id;
     }
     const u32 layer_offset = config.BaseLayer() * info.layer_stride;
     const GPUVAddr image_gpu_addr = config.Address() - layer_offset;
@@ -2070,6 +2084,8 @@ void TextureCache<P>::InvalidateScale(Image& image) {
         Common::DiagTrace::Emit(Common::DiagTrace::Ev::ViewErase, frame_tick,
                                 image_view_id.index, 0, 0, 0);
         slot_image_views.erase(image_view_id);
+        // D6b: clear the gen entry; a later occupant must not inherit it.
+        Common::DiagTrace::Observe([&] { diag_view_gen_.erase(image_view_id.index); });
     }
     image.image_view_ids.clear();
     image.image_view_infos.clear();
@@ -2479,6 +2495,8 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
         revived_id ? revived_id : slot_images.insert(runtime, new_info, gpu_addr, cpu_addr);
     Image& new_image = slot_images[new_image_id];
     u64 diag_trace_obj = 0;
+    // D2: which address space this lineage belongs to (evidence only).
+    const u64 diag_asid = channel_state->gpu_memory.GetID();
     // Diagnostic identity tracking only; skipped entirely when the master
     // switch is off, and fault-contained (map inserts can allocate/throw) so
     // an observer fault can never escape into image creation.
@@ -2497,27 +2515,32 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
                 Common::DiagTrace::S().next_obj_id.fetch_add(1, std::memory_order_relaxed);
             if (diag_images_.size() < 262144 || diag_images_.contains(new_image_id.index)) {
                 diag_images_[new_image_id.index] =
-                    DiagImageRec{diag_trace_obj, gpu_addr, frame_tick, 0, 0};
+                    DiagImageRec{diag_trace_obj, gpu_addr, frame_tick, 0, 0, diag_asid};
             } else {
                 ++diag_identity_skipped;
             }
+            char diag_revive_tag[48];
+            std::snprintf(diag_revive_tag, sizeof(diag_revive_tag), "no-prior-record as%llx",
+                          (unsigned long long)diag_asid);
             Common::DiagTrace::Emit(Common::DiagTrace::Ev::ImageRevive, frame_tick,
                                     diag_trace_obj, new_image_id.index, gpu_addr, 0,
-                                    "no-prior-record");
+                                    diag_revive_tag);
         }
     } else {
         diag_trace_obj =
             Common::DiagTrace::S().next_obj_id.fetch_add(1, std::memory_order_relaxed);
         if (diag_images_.size() < 262144 || diag_images_.contains(new_image_id.index)) {
             diag_images_[new_image_id.index] =
-                DiagImageRec{diag_trace_obj, gpu_addr, frame_tick, 0, 0};
+                DiagImageRec{diag_trace_obj, gpu_addr, frame_tick, 0, 0, diag_asid};
         } else {
             ++diag_identity_skipped;
         }
-        char diag_shape[44];
-        std::snprintf(diag_shape, sizeof(diag_shape), "fmt%u ty%u lv%u la%u",
+        // D9: flags in the shape tag; D2: address space id.
+        char diag_shape[64];
+        std::snprintf(diag_shape, sizeof(diag_shape), "fmt%u ty%u lv%u la%u f%x as%llx",
                       static_cast<u32>(new_info.format), static_cast<u32>(new_info.type),
-                      new_info.resources.levels, new_info.resources.layers);
+                      new_info.resources.levels, new_info.resources.layers,
+                      static_cast<u32>(new_info.flags), (unsigned long long)diag_asid);
         Common::DiagTrace::Emit(Common::DiagTrace::Ev::ImageCreate, frame_tick,
                                 diag_trace_obj, new_image_id.index, gpu_addr,
                                 new_image.guest_size_bytes, diag_shape);
@@ -3579,6 +3602,8 @@ void TextureCache<P>::DeleteImage(ImageId image_id, bool immediate_delete) {
             sentenced_image_view.Push(std::move(slot_image_views[image_view_id]));
         }
         slot_image_views.erase(image_view_id);
+        // D6b: clear the gen entry; a later occupant must not inherit it.
+        Common::DiagTrace::Observe([&] { diag_view_gen_.erase(image_view_id.index); });
     }
     const bool retained = RetainPendingImageDownloads(image_id, slot_images[image_id],
                                                        uncommitted_downloads, committed_downloads);

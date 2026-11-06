@@ -170,6 +170,7 @@ class TextureCache : public VideoCommon::ChannelSetupCaches<TextureCacheChannelI
         u64 created_frame = 0;
         u32 generation = 0;  // bumped on each revive of the same object
         u32 state = 0;       // 0=live 1=deleted(dormant-or-freed; record kept for lineage)
+        u64 asid = 0;        // D2: address space id (gpu_memory.GetID()) at insert
     };
     // Bounded: at the cap, new inserts are skipped and counted (evidence, not lineage).
     std::unordered_map<u32, DiagImageRec> diag_images_;        // slot index -> record
