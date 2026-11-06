@@ -13,6 +13,7 @@
 #include <utility>
 
 #include "common/assert.h"
+#include "common/diag_trace.h"
 #include "common/settings.h"
 #include "common/settings_enums.h"
 #include "core/core.h"
@@ -114,6 +115,8 @@ struct GPU::Impl {
     /// Synchronizes CPU writes with Host GPU memory.
     void InvalidateGPUCache() {
         std::function<void(PAddr, size_t)> callback_writes([this](PAddr address, size_t size) {
+            Common::DiagTrace::Emit(Common::DiagTrace::Ev::HrwDrain,
+                    Common::DiagTrace::CurrentFrame(), address, size, 0, 0);
             renderer->ReadRasterizer()->OnCacheInvalidation(address, size);
         });
         system.GatherGPUDirtyMemory(callback_writes);

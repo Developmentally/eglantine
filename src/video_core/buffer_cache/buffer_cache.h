@@ -13,6 +13,7 @@
 #include <vector>
 #include <fmt/ranges.h>
 
+#include "common/diag_trace.h"
 #include "common/range_sets.inc"
 #include "video_core/buffer_cache/buffer_cache_base.h"
 #include "video_core/guest_memory.h"
@@ -168,6 +169,9 @@ void BufferCache<P>::UnmapGPUMemory(size_t as_id, GPUVAddr gpu_addr, size_t size
 template <class P>
 void BufferCache<P>::WriteMemory(DAddr device_addr, u64 size) {
     BumpWriteEpochs(device_addr, size);
+    Common::DiagTrace::Emit(Common::DiagTrace::Ev::BufEpoch,
+                            Common::DiagTrace::CurrentFrame(),
+                            static_cast<u64>(WriteEpoch(device_addr, size)), device_addr, size, 0);
     if (IsRegionGpuModified(device_addr, size)) {
         ClearDownload(device_addr, size);
         gpu_modified_ranges.Subtract(device_addr, size);
@@ -199,11 +203,17 @@ template <class P>
 bool BufferCache<P>::OnCPUWrite(DAddr device_addr, u64 size) {
     const bool is_dirty = IsRegionRegistered(device_addr, size);
     if (!is_dirty) {
+        Common::DiagTrace::Emit(Common::DiagTrace::Ev::HrwBufReject,
+                            Common::DiagTrace::CurrentFrame(), device_addr, size, 0, 0);
         return false;
     }
     if (memory_tracker.IsRegionGpuModified(device_addr, size)) {
+        Common::DiagTrace::Emit(Common::DiagTrace::Ev::HrwBufAccept,
+                            Common::DiagTrace::CurrentFrame(), device_addr, size, 0, 0);
         return true;
     }
+    Common::DiagTrace::Emit(Common::DiagTrace::Ev::HrwBufReject,
+                            Common::DiagTrace::CurrentFrame(), device_addr, size, 1, 0);
     WriteMemory(device_addr, size);
     return false;
 }
@@ -1870,6 +1880,9 @@ bool BufferCache<P>::SynchronizeBuffer(Buffer& buffer, DAddr device_addr, u32 si
         const DAddr buffer_start = buffer.cpu_addr_cached;
         const auto add_upload = [&](DAddr start, DAddr end) {
             if (start == end) return;
+            Common::DiagTrace::Emit(Common::DiagTrace::Ev::HrwUpload,
+                                    Common::DiagTrace::CurrentFrame(),
+                                    buffer_start, start, end - start, 0, "planned");
             const u64 range_size = end - start;
             upload_copies.push_back(BufferCopy{
                 .src_offset = total_size_bytes,
@@ -1925,6 +1938,10 @@ void BufferCache<P>::UploadMemory(Buffer& buffer, u64 total_size_bytes, u64 larg
     } else {
         ImmediateUploadMemory(buffer, largest_copy, copies);
     }
+    // Completed recorded copy batch (the planned ranges were emitted at add_upload).
+    Common::DiagTrace::Emit(Common::DiagTrace::Ev::HrwUpload,
+                            Common::DiagTrace::CurrentFrame(), buffer.CpuAddr(),
+                            total_size_bytes, copies.size(), 0, "completed");
 }
 
 template <class P>

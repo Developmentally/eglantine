@@ -17,6 +17,7 @@
 // TODO: find out which don't require stable iters
 #include <unordered_map>
 #include "common/container/unordered_map.h"
+#include "common/diag_trace.h"
 #include "common/container/unordered_set.h"
 #include <vector>
 #include <boost/container/small_vector.hpp>
@@ -159,6 +160,22 @@ class TextureCache : public VideoCommon::ChannelSetupCaches<TextureCacheChannelI
     std::vector<u8> astc_scan_buffer;
     u64 images_deleted{};
     std::map<u64, std::pair<u32, GPUVAddr>> created_shapes;
+
+    // eglantine test 3 diagnostic: live identity table (evidence capture only;
+    // no behavior change). Monotonic trace object ids survive slot reuse;
+    // replacement edges are emitted at the actual replacement events.
+    struct DiagImageRec {
+        u64 trace_obj = 0;   // monotonic object id; REUSED on same-object revive
+        u64 gpu_addr = 0;
+        u64 created_frame = 0;
+        u32 generation = 0;  // bumped on each revive of the same object
+        u32 state = 0;       // 0=live 1=deleted(dormant-or-freed; record kept for lineage)
+    };
+    // Bounded: at the cap, new inserts are skipped and counted (evidence, not lineage).
+    std::unordered_map<u32, DiagImageRec> diag_images_;        // slot index -> record
+    std::unordered_map<u32, u64> diag_view_gen_;               // view slot -> generation
+    u64 diag_identity_skipped = 0;
+    bool diag_snapshot_done = false;
     std::vector<ImageId> unbacked_image_ids; ///< Registered images without host memory
     u64 unbacked_retries{};
 
@@ -215,6 +232,24 @@ public:
     explicit TextureCache(Runtime&, Tegra::MaxwellDeviceMemoryManager&);
 
     /// Notify the cache that a new frame has been queued
+    // eglantine test 3 diagnostic accessors (evidence only)
+    u64 FrameTick() const {
+        return frame_tick;
+    }
+    u32 DiagImageFlagsOf(ImageId image_id) const {
+        if (!image_id) {
+            return 0;
+        }
+        return static_cast<u32>(slot_images[image_id].flags);
+    }
+    u64 DiagViewGenOf(VideoCommon::ImageViewId view_id) const {
+        const auto it = diag_view_gen_.find(view_id.index);
+        return it != diag_view_gen_.end() ? it->second : 0;
+    }
+    u64 DiagTraceObjOf(ImageId image_id) const {
+        const auto it = diag_images_.find(image_id.index);
+        return it != diag_images_.end() ? it->second.trace_obj : 0;
+    }
     void TickFrame();
 
     /// Read back the images named by EDEN_NX2_IMAGE_DUMP to files

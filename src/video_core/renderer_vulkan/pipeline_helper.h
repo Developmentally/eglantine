@@ -13,6 +13,9 @@
 #include <boost/container/small_vector.hpp>
 
 #include "common/common_types.h"
+#include <bit>
+#include <cstdio>
+#include "common/diag_trace.h"
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
 #include "shader_recompiler/shader_info.h"
 #include "video_core/renderer_vulkan/vk_texture_cache.h"
@@ -362,7 +365,8 @@ inline void PushImageDescriptors(TextureCache& texture_cache,
                                  const Shader::Info& info, RescalingPushConstant& rescaling,
                                  const VideoCommon::SamplerId*& samplers,
                                  const VideoCommon::ImageViewInOut*& views,
-                                 std::span<const Nx2TextureOverride> overrides = {}) {
+                                 std::span<const Nx2TextureOverride> overrides = {},
+                                 u32 diag_stage = 0) {
     const u32 num_texture_buffers = Shader::NumDescriptors(info.texture_buffer_descriptors);
     const u32 num_image_buffers = Shader::NumDescriptors(info.image_buffer_descriptors);
     views += num_texture_buffers;
@@ -374,14 +378,37 @@ inline void PushImageDescriptors(TextureCache& texture_cache,
             const VideoCommon::SamplerId sampler_id{*(samplers++)};
             ImageView& image_view{texture_cache.GetImageView(image_view_id)};
             VkImageView vk_image_view{image_view.Handle(desc.type)};
+            bool diag_null_fb = false;
+            bool diag_ovr = false;
             if (vk_image_view == VK_NULL_HANDLE) {
                 const VkImageView null_image_view{texture_cache.GetImageView(VideoCommon::NULL_IMAGE_VIEW_ID).Handle(desc.type)};
-                if (null_image_view != VK_NULL_HANDLE) vk_image_view = null_image_view;
+                if (null_image_view != VK_NULL_HANDLE) { vk_image_view = null_image_view; diag_null_fb = true; }
             }
             for (const auto& override : overrides) {
                 if (override.cbuf_offset == desc.cbuf_offset) {
                     vk_image_view = texture_cache.Nx2Runtime().Nx2ConstantView(desc.type, override.rgba);
+                    diag_ovr = true;
                 }
+            }
+            const u32 diag_flags = texture_cache.DiagImageFlagsOf(image_view.image_id);
+            if (Common::DiagTrace::tl_selected_draw ||
+                (diag_flags & (static_cast<u32>(VideoCommon::ImageFlagBits::Unbacked) |
+                               static_cast<u32>(VideoCommon::ImageFlagBits::UnwrittenSparse) |
+                               static_cast<u32>(VideoCommon::ImageFlagBits::ZeroFilled))) != 0) {
+                char diag_tag[48];
+                std::snprintf(diag_tag, sizeof(diag_tag), "s%u x%llx#%u ty%u g%llu%s%s",
+                              diag_stage, (unsigned long long)desc.cbuf_offset, index,
+                              static_cast<u32>(desc.type),
+                              (unsigned long long)texture_cache.DiagViewGenOf(image_view_id),
+                              diag_null_fb ? " null-fallback" : "",
+                              diag_ovr ? " nx2-override" : "");
+                Common::DiagTrace::Emit(Common::DiagTrace::Ev::DescFinal,
+                                        texture_cache.FrameTick(), Common::DiagTrace::tl_draw_seq,
+                                        diag_null_fb || diag_ovr
+                                            ? 0
+                                            : texture_cache.DiagTraceObjOf(image_view.image_id),
+                                        image_view_id.index,
+                                        std::bit_cast<u64>(vk_image_view), diag_tag);
             }
             Sampler& sampler{texture_cache.GetSampler(sampler_id)};
             guest_descriptor_queue.AddSampledImage(vk_image_view,
@@ -399,6 +426,18 @@ inline void PushImageDescriptors(TextureCache& texture_cache,
                 texture_cache.MarkModification(image_view.image_id);
             }
             const VkImageView vk_image_view{image_view.StorageView(desc.type, desc.format)};
+            if (Common::DiagTrace::tl_selected_draw) {
+                char diag_tag[48];
+                std::snprintf(diag_tag, sizeof(diag_tag), "s%u x%llx#%u ty%u storage%s", diag_stage,
+                              (unsigned long long)desc.cbuf_offset, index,
+                              static_cast<u32>(desc.type),
+                              desc.is_written ? " written" : "");
+                Common::DiagTrace::Emit(Common::DiagTrace::Ev::DescFinal,
+                                        texture_cache.FrameTick(), Common::DiagTrace::tl_draw_seq,
+                                        texture_cache.DiagTraceObjOf(image_view.image_id),
+                                        (views - 1)->id.index,
+                                        std::bit_cast<u64>(vk_image_view), diag_tag);
+            }
             guest_descriptor_queue.AddImage(vk_image_view);
             const bool element_rescaled{texture_cache.IsRescaling(image_view)};
             is_rescaled |= element_rescaled;

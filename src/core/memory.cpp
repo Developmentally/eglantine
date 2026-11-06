@@ -16,6 +16,8 @@
 
 #include "common/assert.h"
 #include "common/atomic_ops.h"
+#include "common/diag_trace.h"
+#include "core/gpu_write_gate.h"
 #include "common/common_types.h"
 #include "common/heap_tracker.h"
 #include "common/logging.h"
@@ -733,17 +735,13 @@ struct Memory::Impl {
             // It may not be a good idea to assume accesses are within the same subaddress (i.e same page)
             // It is often the case the games like to access wildly different addresses. Hence why I propose
             // we should let the compiler just do it's thing...
-            if (current_area.last_address != subaddress) {
-                // Short circuit the need to check for address/size
-                auto const do_collection = (address != 0 && size != 0)
-                    && system.GPU().OnCPUWrite(address, size);
-                if (do_collection) {
-                    current_area.last_address = subaddress;
-                } else {
-                    return;
-                }
-            }
-            gpu_dirty_managers[core].Collect(address, size);
+            HandleRasterizerWriteGate(current_area.last_address, subaddress, address, size, core,
+                                      [&](DAddr addr, size_t sz) {
+                                          return system.GPU().OnCPUWrite(addr, sz);
+                                      },
+                                      [&](DAddr addr, size_t sz) {
+                                          gpu_dirty_managers[core].Collect(addr, sz);
+                                      });
         });
     }
 

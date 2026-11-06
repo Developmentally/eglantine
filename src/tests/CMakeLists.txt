@@ -18,6 +18,7 @@ add_executable(tests
     common/unique_function.cpp
     core/core_timing.cpp
     core/internal_network/network.cpp
+    core/gpu_dirty_memory_manager.cpp
     video_core/memory_tracker.cpp
     input_common/calibration_configuration_job.cpp
 )

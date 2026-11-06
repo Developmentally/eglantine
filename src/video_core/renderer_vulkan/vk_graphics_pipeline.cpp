@@ -34,6 +34,7 @@
 #include "video_core/vulkan_common/vulkan_device.h"
 #include "video_core/gpu_logging/gpu_logging.h"
 #include "common/settings.h"
+#include "common/diag_trace.h"
 #include "video_core/nx2.h"
 #include "video_core/nx2_profile.h"
 
@@ -837,7 +838,8 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
             Profile::Scope scope{Profile::Zone::PushDescriptors};
             PushImageDescriptors(texture_cache, guest_descriptor_queue, stage_infos[stage],
                                  rescaling, samplers_it, views_it,
-                                 stage == 4 ? ps_overrides : std::span<const Nx2TextureOverride>{});
+                                 stage == 4 ? ps_overrides : std::span<const Nx2TextureOverride>{},
+                                 static_cast<u32>(stage));
         }
         const auto& info{stage_infos[stage]};
         if (info.uses_render_area) {
@@ -887,6 +889,7 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
 
     VkDeviceSize descriptor_buffer_offset{};
     u32 descriptor_buffer_chunk{};
+    bool diag_reused_allocation = false;
     if (descriptor_set_layout && uses_descriptor_buffer) {
         const auto* const entries = static_cast<const DescriptorUpdateEntry*>(descriptor_data);
         const bool reuse_allocation =
@@ -894,6 +897,7 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
             last_descriptor_payload.size() == num_descriptor_entries &&
             std::memcmp(last_descriptor_payload.data(), entries,
                         num_descriptor_entries * sizeof(DescriptorUpdateEntry)) == 0;
+        diag_reused_allocation = reuse_allocation;
         if (reuse_allocation) {
             descriptor_buffer_offset = last_descriptor_buffer_offset;
             descriptor_buffer_chunk = last_descriptor_buffer_chunk;
@@ -952,7 +956,12 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
                       descriptor_buffer_offset, descriptor_buffer_chunk, bind_descriptor_buffer,
                       rescaling_data = rescaling.Data(), is_rescaling, update_rescaling,
                       uses_render_area = render_area.uses_render_area,
-                      render_area_data = render_area.words](vk::CommandBuffer cmdbuf) {
+                      render_area_data = render_area.words, diag_seq = Common::DiagTrace::tl_draw_seq,
+                      diag_reused = diag_reused_allocation](vk::CommandBuffer cmdbuf) {
+        Common::DiagTrace::Emit(Common::DiagTrace::Ev::DescRoute,
+                                Common::DiagTrace::CurrentFrame(), diag_seq,
+                                uses_descriptor_buffer ? 0 : uses_push_descriptor ? 1 : 2,
+                                num_descriptor_entries, diag_reused ? 1 : 0);
         if (bind_descriptor_buffer) {
             const VkDescriptorBufferBindingInfoEXT binding_info{
                 descriptor_buffer_ring.BindingInfo(descriptor_buffer_chunk)};

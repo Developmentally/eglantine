@@ -22,6 +22,7 @@
 #include "common/alignment.h"
 #include "common/settings.h"
 #include "common/slot_vector.h"
+#include "common/diag_trace.h"
 #include "core/hle/service/nvdrv/devices/nx2_gpu_memory.h"
 #include "video_core/control/channel_state.h"
 #include "video_core/dirty_flags.h"
@@ -495,6 +496,20 @@ void TextureCache<P>::TickFrame() {
         traced_images_text.clear();
     }
     ++frame_tick;
+    Common::DiagTrace::TickFlush(frame_tick);
+    if (!diag_snapshot_done && Common::DiagTrace::InWindow(frame_tick)) {
+        // Pre-window identity snapshot: the live table state when capture begins.
+        diag_snapshot_done = true;
+        for (const auto& [slot, rec] : diag_images_) {
+            char diag_tag[16];
+            std::snprintf(diag_tag, sizeof(diag_tag), "gen%u", rec.generation);
+            Common::DiagTrace::Emit(Common::DiagTrace::Ev::IdentitySnap, frame_tick,
+                                    rec.trace_obj, slot, rec.gpu_addr, rec.state, diag_tag);
+        }
+        Common::DiagTrace::Emit(Common::DiagTrace::Ev::Config, frame_tick,
+                                diag_images_.size(), diag_identity_skipped, 0, 0,
+                                "identity-snapshot-done");
+    }
 
     if constexpr (IMPLEMENTS_ASYNC_DOWNLOADS) {
         for (auto& buffer : async_buffers_death_ring) {
@@ -2047,6 +2062,8 @@ void TextureCache<P>::InvalidateScale(Image& image) {
     RemoveFramebuffers(image_view_ids);
     for (const ImageViewId image_view_id : image_view_ids) {
         sentenced_image_view.Push(std::move(slot_image_views[image_view_id]));
+        Common::DiagTrace::Emit(Common::DiagTrace::Ev::ViewErase, frame_tick,
+                                image_view_id.index, 0, 0, 0);
         slot_image_views.erase(image_view_id);
     }
     image.image_view_ids.clear();
@@ -2456,6 +2473,46 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
     const ImageId new_image_id =
         revived_id ? revived_id : slot_images.insert(runtime, new_info, gpu_addr, cpu_addr);
     Image& new_image = slot_images[new_image_id];
+    u64 diag_trace_obj = 0;
+    if (revived_id) {
+        // Same slot object revived: keep its trace identity, bump the generation.
+        if (auto dit = diag_images_.find(new_image_id.index); dit != diag_images_.end()) {
+            dit->second.state = 0;
+            ++dit->second.generation;
+            diag_trace_obj = dit->second.trace_obj;
+            Common::DiagTrace::Emit(Common::DiagTrace::Ev::ImageRevive, frame_tick,
+                                    diag_trace_obj, new_image_id.index, gpu_addr,
+                                    dit->second.generation, "same-object");
+        } else {
+            diag_trace_obj =
+                Common::DiagTrace::S().next_obj_id.fetch_add(1, std::memory_order_relaxed);
+            if (diag_images_.size() < 262144 || diag_images_.contains(new_image_id.index)) {
+                diag_images_[new_image_id.index] =
+                    DiagImageRec{diag_trace_obj, gpu_addr, frame_tick, 0, 0};
+            } else {
+                ++diag_identity_skipped;
+            }
+            Common::DiagTrace::Emit(Common::DiagTrace::Ev::ImageRevive, frame_tick,
+                                    diag_trace_obj, new_image_id.index, gpu_addr, 0,
+                                    "no-prior-record");
+        }
+    } else {
+        diag_trace_obj =
+            Common::DiagTrace::S().next_obj_id.fetch_add(1, std::memory_order_relaxed);
+        if (diag_images_.size() < 262144 || diag_images_.contains(new_image_id.index)) {
+            diag_images_[new_image_id.index] =
+                DiagImageRec{diag_trace_obj, gpu_addr, frame_tick, 0, 0};
+        } else {
+            ++diag_identity_skipped;
+        }
+        char diag_shape[44];
+        std::snprintf(diag_shape, sizeof(diag_shape), "fmt%u ty%u lv%u la%u",
+                      static_cast<u32>(new_info.format), static_cast<u32>(new_info.type),
+                      new_info.resources.levels, new_info.resources.layers);
+        Common::DiagTrace::Emit(Common::DiagTrace::Ev::ImageCreate, frame_tick,
+                                diag_trace_obj, new_image_id.index, gpu_addr,
+                                new_image.guest_size_bytes, diag_shape);
+    }
 
     new_image.allocation_tick = frame_tick;
     if (!revived_id) {
@@ -2485,6 +2542,12 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
             UntrackImage(overlap, overlap_id);
         }
         UnregisterImage(overlap_id);
+        if (const auto dit = diag_images_.find(overlap_id.index);
+            dit != diag_images_.end()) {
+            Common::DiagTrace::Emit(Common::DiagTrace::Ev::RelatedEvict, frame_tick,
+                                    dit->second.trace_obj, diag_trace_obj, overlap.gpu_addr, 0,
+                                    "join-overlap-delete");
+        }
         DeleteImage(overlap_id);
     }
 
@@ -3181,6 +3244,9 @@ template <class P>
 ImageViewId TextureCache<P>::FindOrEmplaceImageView(ImageId image_id, const ImageViewInfo& info) {
     Image& image = slot_images[image_id];
     if (const ImageViewId image_view_id = image.FindView(info); image_view_id) {
+        Common::DiagTrace::Emit(Common::DiagTrace::Ev::ViewCacheHit, frame_tick,
+                                image_view_id.index, DiagTraceObjOf(image_id),
+                                diag_view_gen_[image_view_id.index], 0);
         return image_view_id;
     }
     if (True(image.flags & ImageFlagBits::Unbacked) &&
@@ -3192,6 +3258,10 @@ ImageViewId TextureCache<P>::FindOrEmplaceImageView(ImageId image_id, const Imag
                  info.range.extent.layers);
     }
     const ImageViewId image_view_id = slot_image_views.insert(runtime, info, image_id, image, slot_images);
+    const u64 diag_vgen = ++diag_view_gen_[image_view_id.index];
+    Common::DiagTrace::Emit(Common::DiagTrace::Ev::ViewCreate, frame_tick,
+                            image_view_id.index, DiagTraceObjOf(image_id), diag_vgen,
+                            static_cast<u64>(info.type));
     image.InsertView(info, image_view_id);
     return image_view_id;
 }
@@ -3507,6 +3577,14 @@ void TextureCache<P>::DeleteImage(ImageId image_id, bool immediate_delete) {
         } else {
             slot_bytes += freed_bytes;
         }
+    }
+    if (const auto dit = diag_images_.find(image_id.index); dit != diag_images_.end()) {
+        // Emitted at the actual slot-free point; address taken from the record because
+        // the image may already be moved-from (sentenced).
+        Common::DiagTrace::Emit(Common::DiagTrace::Ev::ImageErase, frame_tick,
+                                dit->second.trace_obj, image_id.index, dit->second.gpu_addr,
+                                dit->second.created_frame);
+        dit->second.state = 1;
     }
     slot_images.erase(image_id);
 

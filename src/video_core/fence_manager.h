@@ -12,6 +12,7 @@
 #include <cstring>
 #include <deque>
 #include <functional>
+#include "common/diag_trace.h"
 #include <mutex>
 #include <thread>
 #include <vector>
@@ -88,6 +89,8 @@ public:
         if (!delay_fence && committed_flushes == 0 && SkipEmptyFence()) {
             Nx2Profile::Scope skipped_scope{Nx2Profile::Zone::FenceSkipped};
             func();
+            Common::DiagTrace::Emit(Common::DiagTrace::Ev::HrwGather,
+                                Common::DiagTrace::CurrentFrame(), 0, 0, 0, 0, "fence-skip-path");
             rasterizer.InvalidateGPUCache();
             return;
         }
@@ -119,6 +122,8 @@ public:
             guard.unlock();
             cv.notify_all();
         }
+        Common::DiagTrace::Emit(Common::DiagTrace::Ev::HrwGather,
+                            Common::DiagTrace::CurrentFrame(), 1, 0, 0, 0, "fence-normal-path");
         rasterizer.InvalidateGPUCache();
     }
 

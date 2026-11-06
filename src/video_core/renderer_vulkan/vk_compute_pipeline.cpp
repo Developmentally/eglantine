@@ -25,6 +25,7 @@
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 #include "video_core/gpu_logging/gpu_logging.h"
 #include "common/logging.h"
+#include "common/diag_trace.h"
 #include "common/settings.h"
 
 namespace Vulkan {
@@ -290,7 +291,7 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
     const VideoCommon::SamplerId* samplers_it{samplers.data()};
     const VideoCommon::ImageViewInOut* views_it{views.data()};
     PushImageDescriptors(texture_cache, guest_descriptor_queue, info, rescaling, samplers_it,
-                         views_it);
+                         views_it, {}, 6u);
 
     if (!is_built.load(std::memory_order::relaxed)) {
         // Wait for the pipeline to be built
@@ -327,6 +328,7 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
     const bool is_rescaling = !info.texture_descriptors.empty() || !info.image_descriptors.empty();
     scheduler.Record([this, descriptor_data, is_rescaling, descriptor_buffer_offset,
                       descriptor_buffer_chunk, bind_descriptor_buffer,
+                      diag_seq = Common::DiagTrace::tl_draw_seq,
                       rescaling_data = rescaling.Data()](vk::CommandBuffer cmdbuf) {
         if (bind_descriptor_buffer) {
             const VkDescriptorBufferBindingInfoEXT binding_info{
@@ -334,12 +336,18 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
             cmdbuf.BindDescriptorBuffersEXT(binding_info);
         }
         if (!pipeline) {
+            Common::DiagTrace::Emit(Common::DiagTrace::Ev::DescRoute,
+                                    Common::DiagTrace::CurrentFrame(), diag_seq, 255, 0, 0);
             return;
         }
         cmdbuf.BindPipeline(VK_PIPELINE_BIND_POINT_COMPUTE, *pipeline);
         if (!descriptor_set_layout) {
             return;
         }
+        Common::DiagTrace::Emit(Common::DiagTrace::Ev::DescRoute,
+                                Common::DiagTrace::CurrentFrame(), diag_seq,
+                                uses_descriptor_buffer ? 0 : uses_push_descriptor ? 1 : 2,
+                                num_descriptor_entries, 0);
         if (is_rescaling) {
             cmdbuf.PushConstants(*pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT,
                                  RESCALING_LAYOUT_WORDS_OFFSET, sizeof(rescaling_data),

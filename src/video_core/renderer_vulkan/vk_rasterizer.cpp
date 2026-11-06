@@ -28,6 +28,7 @@
 #include "common/string_util.h"
 #include "shader_recompiler/exception.h"
 #include "common/logging.h"
+#include "common/diag_trace.h"
 #include "common/scope_exit.h"
 #include "common/settings.h"
 #include "core/hle/service/nvdrv/devices/nx2_gpu_memory.h"
@@ -1013,6 +1014,9 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {
     }
 
     const auto report_failure = [&](std::string_view reason) {
+        Common::DiagTrace::Emit(Common::DiagTrace::Ev::DrawSkip, texture_cache.FrameTick(),
+                                Common::DiagTrace::tl_draw_seq, 0, 0, 0,
+                                std::string(reason).c_str());
         static std::set<std::tuple<u64, u64, std::string_view>> seen;
         const auto& regs = maxwell3d->regs;
         const u64 vs = (u64{regs.pipelines[1].reserved[0] & 0xff} << 32) | regs.pipelines[1].reserved[1];
@@ -1234,6 +1238,8 @@ void RasterizerVulkan::RecordDrawStats(u64 draws, u64 vertices, bool indirect) {
 
 void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
     VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::Draw};
+    Common::DiagTrace::BeginDraw(texture_cache.FrameTick(), Common::DiagTrace::tl_draw_seq);
+    SCOPE_EXIT { Common::DiagTrace::EndDraw(); };
     SCOPE_EXIT {
         if (ChunkBatchingEnabled()) {
             maxwell3d->ClearWritesSinceDraw();
@@ -1788,12 +1794,20 @@ void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
         const DrawParams draw_params{MakeDrawParams(draw_state, num_instances, is_indexed)};
 
         if (mesh_draw) {
-            scheduler.Record([groups = draw_params.num_vertices](vk::CommandBuffer cmdbuf) {
+            scheduler.Record([groups = draw_params.num_vertices,
+                              diag_seq = Common::DiagTrace::tl_draw_seq,
+                              diag_frame = Common::DiagTrace::CurrentFrame()](vk::CommandBuffer cmdbuf) {
+                Common::DiagTrace::Emit(Common::DiagTrace::Ev::Draw, diag_frame, diag_seq,
+                                        groups, 1, 3);
                 cmdbuf.DrawMeshTasksEXT(groups, 1, 1);
             });
             return;
         }
-        scheduler.Record([draw_params](vk::CommandBuffer cmdbuf) {
+        scheduler.Record([draw_params, diag_seq = Common::DiagTrace::tl_draw_seq,
+                          diag_frame = Common::DiagTrace::CurrentFrame()](vk::CommandBuffer cmdbuf) {
+            Common::DiagTrace::Emit(Common::DiagTrace::Ev::Draw, diag_frame, diag_seq,
+                                    draw_params.num_vertices, draw_params.num_instances,
+                                    draw_params.is_indexed ? 1 : 0);
             if (draw_params.is_indexed) {
                 cmdbuf.DrawIndexed(draw_params.num_vertices, draw_params.num_instances,
                                    draw_params.first_index, draw_params.base_vertex,
@@ -1886,6 +1900,8 @@ void RasterizerVulkan::DrawIndirect() {
     if (!chunk_batches.empty()) {
         FlushChunkBatches();
     }
+    Common::DiagTrace::BeginDraw(texture_cache.FrameTick(), Common::DiagTrace::tl_draw_seq);
+    SCOPE_EXIT { Common::DiagTrace::EndDraw(); };
     VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::Draw};
     const auto& params = maxwell3d->draw_manager.indirect_state;
     if (static const bool stats = std::getenv("EDEN_NX2_DRAW_STATS") != nullptr; stats) {
@@ -1906,7 +1922,11 @@ void RasterizerVulkan::DrawIndirect() {
         const auto& offset = indirect_buffer.second;
         if (params.is_byte_count) {
             scheduler.Record([buffer_obj = buffer->Handle(), offset,
-                              stride = params.stride](vk::CommandBuffer cmdbuf) {
+                              stride = params.stride,
+                              diag_seq = Common::DiagTrace::tl_draw_seq,
+                              diag_frame = Common::DiagTrace::CurrentFrame()](vk::CommandBuffer cmdbuf) {
+                Common::DiagTrace::Emit(Common::DiagTrace::Ev::Draw, diag_frame, diag_seq,
+                                        0, 0, 4);
                 cmdbuf.DrawIndirectByteCountEXT(1, 0, buffer_obj, offset, 0,
                                                 static_cast<u32>(stride));
             });
@@ -1918,7 +1938,10 @@ void RasterizerVulkan::DrawIndirect() {
             const auto& offset_base = count.second;
             scheduler.Record([draw_buffer_obj = draw_buffer->Handle(),
                               buffer_obj = buffer->Handle(), offset_base, offset,
-                              params](vk::CommandBuffer cmdbuf) {
+                              params, diag_seq = Common::DiagTrace::tl_draw_seq,
+                              diag_frame = Common::DiagTrace::CurrentFrame()](vk::CommandBuffer cmdbuf) {
+                Common::DiagTrace::Emit(Common::DiagTrace::Ev::Draw, diag_frame, diag_seq,
+                                        params.max_draw_counts, params.stride, 5);
                 if (params.is_indexed) {
                     cmdbuf.DrawIndexedIndirectCount(
                         buffer_obj, offset, draw_buffer_obj, offset_base,
@@ -1931,7 +1954,11 @@ void RasterizerVulkan::DrawIndirect() {
             });
             return;
         }
-        scheduler.Record([buffer_obj = buffer->Handle(), offset, params](vk::CommandBuffer cmdbuf) {
+        scheduler.Record([buffer_obj = buffer->Handle(), offset, params,
+                          diag_seq = Common::DiagTrace::tl_draw_seq,
+                          diag_frame = Common::DiagTrace::CurrentFrame()](vk::CommandBuffer cmdbuf) {
+            Common::DiagTrace::Emit(Common::DiagTrace::Ev::Draw, diag_frame, diag_seq,
+                                    params.max_draw_counts, params.stride, 6);
             if (params.is_indexed) {
                 cmdbuf.DrawIndexedIndirect(buffer_obj, offset,
                                            static_cast<u32>(params.max_draw_counts),
@@ -2242,6 +2269,8 @@ void RasterizerVulkan::DispatchCompute() {
     if (!chunk_batches.empty()) {
         FlushChunkBatches();
     }
+    Common::DiagTrace::BeginDraw(texture_cache.FrameTick(), Common::DiagTrace::tl_draw_seq);
+    SCOPE_EXIT { Common::DiagTrace::EndDraw(); };
     VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::Compute};
     if (frame_trace_state == 2) {
         const auto& qmd = kepler_compute->launch_description;
@@ -2297,10 +2326,13 @@ void RasterizerVulkan::DispatchCompute() {
     };
     scheduler.Record([](vk::CommandBuffer cmdbuf) { cmdbuf.PipelineBarrier(vk::PIPELINE_STAGE_GRAPHICS_COMPUTE_TRANSFER, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                                0, READ_BARRIER); });
-    scheduler.Record([pipeline, dim](vk::CommandBuffer cmdbuf) {
+    scheduler.Record([pipeline, dim, diag_seq = Common::DiagTrace::tl_draw_seq,
+                      diag_frame = Common::DiagTrace::CurrentFrame()](vk::CommandBuffer cmdbuf) {
         if (!pipeline->IsBound()) {
             return;
         }
+        Common::DiagTrace::Emit(Common::DiagTrace::Ev::Draw, diag_frame, diag_seq,
+                                dim[0], (u64{dim[1]} << 32) | dim[2], 2);
         cmdbuf.Dispatch(dim[0], dim[1], dim[2]);
     });
 
@@ -2467,6 +2499,8 @@ void RasterizerVulkan::OnCacheInvalidation(DAddr addr, u64 size) {
     if (addr == 0 || size == 0) {
         return;
     }
+    Common::DiagTrace::Emit(Common::DiagTrace::Ev::HrwCacheInval,
+        Common::DiagTrace::CurrentFrame(), addr, size, 0, 0);
 
     {
         std::scoped_lock lock{texture_cache.mutex};
