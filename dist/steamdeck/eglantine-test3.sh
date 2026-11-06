@@ -145,9 +145,18 @@ if [ "$marker_ok" != 1 ]; then
     die "settings not seeded yet (no valid seed receipt marker). Run: ./eglantine-test3.sh --seed-from <path to your working eglantine-deck.ini>$clue (see README-test3.txt)"
 fi
 marker_line="$(cat -- "$receipt")"
+# A real receipt always records EQUAL src and dst hashes (the seed verified
+# the match before publishing), so a well-formed line with unequal digests
+# was never produced by this script - refuse it even if someone appended a
+# matching line to the sessions log.
+m_src="${marker_line#* src-sha256=}"; m_src="${m_src%% *}"
+m_dst="${marker_line##* dst-sha256=}"
+if [ "$m_src" != "$m_dst" ]; then
+    die "the seed marker records unequal src/dst hashes, which no real seed ever writes - refusing. Seed again: ./eglantine-test3.sh --seed-from <path to your working eglantine-deck.ini>"
+fi
 last_seed="$(grep -h '^eglantine-test3: seeded settings from ' "$sessions" 2>/dev/null | tail -1)"
 if [ -z "$last_seed" ] || [ "$marker_line" != "$last_seed" ]; then
-    die "the seed marker does not match the latest seed receipt in '$sessions' - the marker or the log was changed outside the recorded flow. Seed again: ./eglantine-test3.sh --seed-from <path to your working eglantine-deck.ini>"
+    die "the seed marker does not match the latest seed receipt in '$sessions' - the sessions log may have been lost or truncated, or the marker was changed afterwards. Seed again: ./eglantine-test3.sh --seed-from <path to your working eglantine-deck.ini>"
 fi
 ini_now="$(hash_of "$EGLANTINE_SETTINGS")" || exit 1
 dst_hash="${marker_line##* dst-sha256=}"
@@ -166,7 +175,7 @@ else
     fi
 fi
 if [ "$config_ok" != 1 ]; then
-    die "eglantine-test3.ini matches neither the seeded bytes nor the recorded end-state of the last session - the config was changed outside the recorded flow. Seed again: ./eglantine-test3.sh --seed-from <path to your working eglantine-deck.ini>"
+    die "eglantine-test3.ini matches neither the seeded bytes nor the recorded end-state of the last session - the previous run may have been interrupted before recording its end-state (wrapper killed, power lost, sessions log lost), or the config was changed outside the recorded flow. This is not necessarily tampering; seed again to re-establish the chain: ./eglantine-test3.sh --seed-from <path to your working eglantine-deck.ini>"
 fi
 # Run-time guard: a symlinked OR hardlinked settings file would make the
 # build's startup rewrite write through to whatever shares the inode

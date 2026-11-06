@@ -41,11 +41,15 @@ STEP 1 - seed the diagnostic settings from your ACTUAL working settings:
   symlink or its bytes match neither the seeded state nor the recorded
   end-state of the last session - there is no bypass. A seed that fails at
   any step (copy, hashing, hash match, log append, marker publication)
-  exits nonzero and publishes no marker. One limit to know: if the
+  exits nonzero and publishes no marker. Two limits to know: if the
   filesystem refuses to delete an OLD marker, the seed stops with a loud
   error naming it and changes no permissions - delete it yourself and seed
-  again. Until you do, launching still uses the last good seed's settings,
-  exactly as if the failed re-seed had never been attempted. (To run with the
+  again; until you do, launching still uses the last good seed's settings,
+  exactly as if the failed re-seed had never been attempted. And if a run
+  is interrupted before it can record its end-state (the wrapper is
+  killed, power is lost, or the sessions log is lost), the next launch
+  refuses and asks you to seed again - that is the evidence chain being
+  re-established, not an accusation that anything was tampered with. (To run with the
   packaged default on purpose, seed from this folder's eglantine-deck.ini;
   the receipt records that choice.)
 

@@ -46,10 +46,18 @@
 #  19 config tamper:         after a real seed, ini modified outside the recorded flow
 #                            -> launch refuses (neither seeded bytes nor recorded
 #                            end-state)
+#  18b unequal-pair receipt: valid-shape src!=dst digests (dst = the REAL ini hash)
+#                            with a forged matching sessions line -> launch refuses
+#                            (no real seed ever writes unequal hashes)
 #  20 legit continuation:    dummy AppImage rewrites the ini like the real build's
 #                            startup normalization; launch 1 and launch 2 BOTH pass the
 #                            gate (recorded end-state branch) - guards over-refusal
+#  21 log loss:              sessions log deleted, or the receipt line truncated out,
+#                            after a real seed -> launch refuses (re-seed recovers)
 set -u
+# The injected permission failures (chmod 555/444/000) only bind a NON-ROOT
+# user; running this harness as root would make them silently ineffective.
+[ "$(id -u)" -ne 0 ] || { echo "FATAL: run this harness as a NON-ROOT user; the permission injections are no-ops for root"; exit 1; }
 REPO=${REPO:-/tmp/wt-test3}
 KIT_SRC="$REPO/dist/steamdeck"
 WORK=$(mktemp -d /tmp/seed-fail-test.XXXXXX)
@@ -252,6 +260,7 @@ out=$("$D/eglantine-test3.sh" --seed-from "$SRCINI" 2>&1); rc=$?
 expect "seed rc nonzero" "$rc_note" "nonzero"
 expect "target mode UNCHANGED (640)" "$(stat -c %a "$TARGET")" "640"
 expect "target content unchanged" "$(cat "$TARGET")" "unrelated"
+expect "target link count UNCHANGED (1)" "$(stat -c %h "$TARGET")" "1"
 out=$("$D/eglantine-test3.sh" 2>&1); rc=$?
 expect "launch refuses symlinked marker" "$rc" "1"
 expect "refusal names invalid marker" "$(echo "$out" | grep -c 'no valid seed receipt marker')" "1"
@@ -267,6 +276,8 @@ out=$("$D/eglantine-test3.sh" --seed-from "$SRCINI" 2>&1); rc=$?
 [ "$rc" = 0 ] && rc_note=0 || rc_note=nonzero
 expect "seed rc nonzero" "$rc_note" "nonzero"
 expect "target mode UNCHANGED (640)" "$(stat -c %a "$TARGET")" "640"
+expect "target content unchanged" "$(cat "$TARGET")" "unrelated2"
+expect "target link count UNCHANGED (2)" "$(stat -c %h "$TARGET")" "2"
 out=$("$D/eglantine-test3.sh" 2>&1); rc=$?
 expect "launch refuses multi-linked marker" "$rc" "1"
 expect "no capture started" "$(echo "$out" | grep -c 'diagnostic capture')" "0"
@@ -280,7 +291,7 @@ expect "launch refuses (rc 1)" "$rc" "1"
 expect "message names marker/log mismatch" "$(echo "$out" | grep -c 'does not match the latest seed receipt')" "1"
 expect "no capture started" "$(echo "$out" | grep -c 'diagnostic capture')" "0"
 
-note "CASE 18 fabricated receipt: valid shape, unequal 64-hex digests, after a real seed"
+note "CASE 18 fabricated receipt: valid shape, digests not matching the recorded receipt, after a real seed"
 D="$WORK/c18"; mk_kit "$D"
 "$D/eglantine-test3.sh" --seed-from "$SRCINI" >/dev/null 2>&1
 printf "eglantine-test3: seeded settings from '/tmp/fake' src-sha256=cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc dst-sha256=cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\n" > "$D/eglantine-test3.seeded"
@@ -288,6 +299,33 @@ out=$("$D/eglantine-test3.sh" 2>&1); rc=$?
 expect "launch refuses (rc 1)" "$rc" "1"
 expect "message names marker/log mismatch" "$(echo "$out" | grep -c 'does not match the latest seed receipt')" "1"
 expect "no capture started" "$(echo "$out" | grep -c 'diagnostic capture')" "0"
+
+note "CASE 18b unequal src/dst invariant: valid-shape pair, dst matches the real ini, sessions line forged to match"
+D="$WORK/c18b"; mk_kit "$D"
+"$D/eglantine-test3.sh" --seed-from "$SRCINI" >/dev/null 2>&1
+real_ini_hash="$(sha256sum "$D/eglantine-test3.ini" | cut -d' ' -f1)"
+forged="eglantine-test3: seeded settings from '/tmp/fake' src-sha256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa dst-sha256=$real_ini_hash"
+printf '%s\n' "$forged" > "$D/eglantine-test3.seeded"
+printf '%s\n' "$forged" >> "$D/eglantine-test3-sessions.log"
+out=$("$D/eglantine-test3.sh" 2>&1); rc=$?
+expect "launch refuses unequal-pair receipt (rc 1)" "$rc" "1"
+expect "message names unequal src/dst" "$(echo "$out" | grep -c 'unequal src/dst hashes')" "1"
+expect "no capture started" "$(echo "$out" | grep -c 'diagnostic capture')" "0"
+
+note "CASE 21 sessions log lost or truncated after a real seed"
+D="$WORK/c21"; mk_kit "$D"
+"$D/eglantine-test3.sh" --seed-from "$SRCINI" >/dev/null 2>&1
+rm "$D/eglantine-test3-sessions.log"
+out=$("$D/eglantine-test3.sh" 2>&1); rc=$?
+expect "launch refuses after log loss (rc 1)" "$rc" "1"
+expect "message names marker/log mismatch" "$(echo "$out" | grep -c 'does not match the latest seed receipt')" "1"
+expect "no capture started" "$(echo "$out" | grep -c 'diagnostic capture')" "0"
+D="$WORK/c21b"; mk_kit "$D"
+"$D/eglantine-test3.sh" --seed-from "$SRCINI" >/dev/null 2>&1
+grep -v 'seeded settings from' "$D/eglantine-test3-sessions.log" > "$D/truncated"; mv "$D/truncated" "$D/eglantine-test3-sessions.log"  # grep rc 1 = every line removed = intended here
+out=$("$D/eglantine-test3.sh" 2>&1); rc=$?
+expect "launch refuses after receipt truncated out (rc 1)" "$rc" "1"
+expect "no capture started (truncated)" "$(echo "$out" | grep -c 'diagnostic capture')" "0"
 
 note "CASE 19 config changed outside the recorded flow"
 D="$WORK/c19"; mk_kit "$D"
@@ -314,9 +352,10 @@ out=$("$D/eglantine-test3.sh" "$D/MKW" 2>&1); rc=$?
 expect "launch 2 passes gate via recorded end-state (rc 1 from dummy)" "$rc" "1"
 expect "launch 2 capture started" "$(echo "$out" | grep -c 'diagnostic capture')" "1"
 
+ncases=$(grep -c '^--- CASE ' "$0" 2>/dev/null || echo '?')
 echo ""
 if [ "$fails" = 0 ]; then
-  echo "SEED FAILURE-INJECTION: all expectations met (20 cases)"
+  echo "SEED FAILURE-INJECTION: all expectations met ($ncases case groups run)"
 else
   echo "SEED FAILURE-INJECTION: $fails expectation(s) FAILED"
   exit 1
