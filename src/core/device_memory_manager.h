@@ -39,6 +39,9 @@ struct Asid {
     size_t id;
 };
 
+// eglantine test 3: test-only fixture seam (defined in the fixture test).
+struct DeviceMemoryManagerTestAccess;
+
 template <typename Traits>
 class DeviceMemoryManager {
     using DeviceInterface = typename Traits::DeviceInterface;
@@ -257,7 +260,9 @@ private:
     Common::RangeMutex counter_guard;
     std::mutex mapping_guard;
 
-
+    // eglantine test 3: test-only access for the criterion-2 fixture's
+    // MapForTest seam (no behavior change; the accessor lives in the test).
+    friend struct DeviceMemoryManagerTestAccess;
 };
 
 } // namespace Core

@@ -15,6 +15,10 @@
 // mutex; the texture-cache identity tables are std::unordered_map and their
 // inserts can allocate (and therefore throw) on emulator paths.
 //
+// A contained observer fault inside Observe() can consume an identity id
+// before its map insert: identity gaps are possible and observable via
+// observer_errors, never silent corruption of the emulator state.
+//
 // Counter semantics: emitted[X] = ring writes; dropped[X] = ring-overflow
 // victims charged to the VICTIM's class plus budget-halt discards (exact at
 // all times); observer_errors = contained observer faults (init, emit, flush
@@ -396,6 +400,12 @@ inline std::string CounterSummary() {
         S().tag_truncated.load(std::memory_order_relaxed),
         S().observer_errors.load(std::memory_order_relaxed),
         S().late_after_halt.load(std::memory_order_relaxed));
+    if (S().init_broken.load(std::memory_order_relaxed)) {
+        out += " init_broken=1";
+    }
+    if (S().flush_broken.load(std::memory_order_relaxed)) {
+        out += " flush_broken=1";
+    }
     return out;
 }
 

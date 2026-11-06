@@ -575,3 +575,78 @@ TEST_CASE("GPUDirtyMemoryManager gate T11: size==0 on a fresh nonzero page neith
     REQUIRE(g.collects == 0);
     REQUIRE(g.last == 0); // unseeded
 }
+
+// ---------------------------------------------------------------------------
+// Criterion-2 real-path seam (CPU lane v3, editor-steered): the production
+// diff is the single friend declaration above; the accessor below reproduces
+// DeviceMemoryManager::Map's simple base_dev==0 branch
+// (device_memory_manager.inc:206-246) EXACTLY, with the
+// process_memory->GetPointerSilent call replaced by a test resolver.
+// OUT OF SCOPE (explicitly not exercised): Map itself, the multi-device
+// branch, track=true / TrackContinuityImpl, Unmap, and reverse-map readers.
+// Mapping-loop equivalence is NOT claimed beyond this branch.
+// ---------------------------------------------------------------------------
+// Defined in namespace Core to match the friend declaration.
+struct Core::DeviceMemoryManagerTestAccess {
+    template <typename Traits>
+    static void MapForTest(Core::DeviceMemoryManager<Traits>& m, DAddr address,
+                           VAddr virtual_address, size_t size, Core::Asid asid,
+                           u8* (*resolve)(void*, VAddr), void* ctx) {
+        const size_t start_page_d = address >> Core::Memory::YUZU_PAGEBITS;
+        const size_t num_pages =
+            Common::AlignUp(size, Core::Memory::YUZU_PAGESIZE) >> Core::Memory::YUZU_PAGEBITS;
+        std::scoped_lock lk(m.mapping_guard);
+        m.tracked_entries.CommitRegion(start_page_d, start_page_d + num_pages);
+        for (size_t i = 0; i < num_pages; i++) {
+            const VAddr new_vaddress = virtual_address + i * Core::Memory::YUZU_PAGESIZE;
+            u8* ptr = resolve(ctx, new_vaddress);
+            if (ptr == nullptr) {
+                m.tracked_entries.GetUnchecked(start_page_d + i).compressed_physical_ptr = 0;
+                continue;
+            }
+            const auto phys_addr =
+                static_cast<u32>(m.GetRawPhysicalAddr(ptr) >> Core::Memory::YUZU_PAGEBITS) + 1U;
+            m.tracked_entries.GetUnchecked(start_page_d + i).compressed_physical_ptr = phys_addr;
+            m.InsertCPUBacking(start_page_d + i, new_vaddress, asid);
+            const u32 base_dev = m.compressed_device_addr[phys_addr - 1U];
+            REQUIRE(base_dev == 0); // multi-device branch is out of test scope
+            m.compressed_device_addr.GetAndFault(phys_addr - 1U) =
+                static_cast<u32>(start_page_d + i);
+        }
+        m.translation_generation.fetch_add(1, std::memory_order_release);
+    }
+};
+
+namespace {
+constexpr DAddr kSeamDev = 0x0000'0004'0000; // device address of the mapped span
+constexpr VAddr kSeamGuest = 0x0000'4000'0000'0000; // unique per case (TLS Translations reuse)
+constexpr PAddr kSeamPhys = 0x0000'0020'0000; // offset inside the DeviceMemory backing
+constexpr u64 kSeamWindow = 4096; // one page
+} // namespace
+
+TEST_CASE("Criterion2 seam: MapForTest round-trips through real ReadBlockUnsafe", "[gpu_dirty]") {
+    Core::DeviceMemory backing;
+    Tegra::MaxwellDeviceMemoryManager gmmu{backing};
+    gmmu.RegisterProcess(nullptr); // one slot; the abort stubs trip on any deref
+    const Core::Asid asid{.id = 0};
+
+    const auto resolver = +[](void* ctx, VAddr v) -> u8* {
+        return static_cast<Core::DeviceMemory*>(ctx)->GetPointerFromRaw<u8>(kSeamPhys +
+                                                                            (v - kSeamGuest));
+    };
+    Core::DeviceMemoryManagerTestAccess::MapForTest(gmmu, kSeamDev, kSeamGuest, kSeamWindow, asid,
+                                              resolver, &backing);
+
+    // Bytes written through the guest resolver land in the backing...
+    std::memset(backing.GetPointerFromRaw<u8>(kSeamPhys), 0x5A, 128);
+    // ...and the REAL upload read path (MappedUploadMemory -> ReadBlockUnsafe
+    // -> tracked_entries.compressed_physical_ptr) returns exactly those bytes.
+    std::array<u8, 128> out{};
+    gmmu.ReadBlockUnsafe(kSeamDev, out.data(), out.size());
+    REQUIRE(std::all_of(out.begin(), out.end(), [](u8 b) { return b == 0x5A; }));
+    // Writes through the real WriteBlockUnsafe land at the same backing bytes.
+    const std::array<u8, 64> in{[] { std::array<u8, 64> a{}; a.fill(0xC3); return a; }()};
+    gmmu.WriteBlockUnsafe(kSeamDev + 128, in.data(), in.size());
+    REQUIRE(std::memcmp(backing.GetPointerFromRaw<u8>(kSeamPhys + 128), in.data(),
+                        in.size()) == 0);
+}
