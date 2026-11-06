@@ -505,6 +505,11 @@ void TextureCache<P>::TickFrame() {
         Common::DiagTrace::InWindow(frame_tick)) {
         // Pre-window identity snapshot: the live table state when capture begins.
         // Observer-only containment: a fault here can never escape TickFrame.
+        // Drain any pre-existing ring contents first: a full ring at snapshot
+        // start would overwrite older events before the first chunk flush
+        // (still not a guarantee against concurrent emitters - losses are
+        // counted, not prevented).
+        Common::DiagTrace::Flush(frame_tick, "identity-snap-start");
         Common::DiagTrace::Observe([&] {
             diag_snapshot_done = true;
             // D7: state-1 (deleted) records are skipped - their lineage is
@@ -901,14 +906,22 @@ typename P::Framebuffer* TextureCache<P>::GetFramebuffer() {
                 if (!id) {
                     continue;
                 }
+                char diag_rt_tag[40];
+                std::snprintf(diag_rt_tag, sizeof(diag_rt_tag), "v%u g%llu", id.index,
+                              (unsigned long long)DiagViewGenOf(id));
                 Common::DiagTrace::Emit(Common::DiagTrace::Ev::RTBind, frame_tick,
                                         Common::DiagTrace::tl_draw_seq,
-                                        DiagTraceObjOf(slot_image_views[id].image_id), rt, 0);
+                                        DiagTraceObjOf(slot_image_views[id].image_id), rt, 0,
+                                        diag_rt_tag);
             }
             if (const ImageViewId id = render_targets.depth_buffer_id) {
+                char diag_rt_tag[40];
+                std::snprintf(diag_rt_tag, sizeof(diag_rt_tag), "v%u g%llu", id.index,
+                              (unsigned long long)DiagViewGenOf(id));
                 Common::DiagTrace::Emit(Common::DiagTrace::Ev::RTBind, frame_tick,
                                         Common::DiagTrace::tl_draw_seq,
-                                        DiagTraceObjOf(slot_image_views[id].image_id), 0, 1);
+                                        DiagTraceObjOf(slot_image_views[id].image_id), 0, 1,
+                                        diag_rt_tag);
             }
         });
     }
@@ -1358,6 +1371,10 @@ bool TextureCache<P>::BlitImage(const Tegra::Engines::Fermi2D::Surface& dst,
         scale_region(dst_region);
     }
 
+    // F1 (CopyDep): the blit is issued below in either constexpr branch; both
+    // ends have real texture-cache identity here. d = 0 (no count at this site).
+    Common::DiagTrace::Emit(Common::DiagTrace::Ev::CopyDep, frame_tick,
+                            DiagTraceObjOf(src_id), DiagTraceObjOf(dst_id), 0, 0, "blit");
     // Always call this after src_framebuffer_id was queried, as the address might be invalidated.
     Framebuffer* const dst_framebuffer = &slot_framebuffers[dst_framebuffer_id];
     if constexpr (FRAMEBUFFER_BLITS) {
@@ -2726,6 +2743,10 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
             }
             const AliasedImage& aliased = new_image.aliased_images[alias_pointer->second];
             CopyImage(new_image_id, aliased.id, aliased.copies);
+            // F1 (CopyDep): the actual alias copy; d = copy-region count, NOT bytes.
+            Common::DiagTrace::Emit(Common::DiagTrace::Ev::CopyDep, frame_tick,
+                                    DiagTraceObjOf(aliased.id), diag_trace_obj,
+                                    static_cast<u64>(aliased.copies.size()), 0, "join-alias");
             new_image.modification_tick = overlap.modification_tick;
             continue;
         }
@@ -2746,6 +2767,10 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
                                (std::min)(overlap.info.size.height, new_image.info.size.height), 1},
                 };
                 runtime.CopyImage(new_image, overlap, std::array{copy});
+                // F1 (CopyDep): the actual resize copy; d = layers copied, NOT bytes.
+                Common::DiagTrace::Emit(Common::DiagTrace::Ev::CopyDep, frame_tick,
+                                        DiagTraceObjOf(copy_object.id), diag_trace_obj,
+                                        static_cast<u64>(layers), 0, "join-resize");
                 new_image.modification_tick = overlap.modification_tick;
             }
             ++render_target_resizes;
@@ -2762,10 +2787,17 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
             const u32 up_scale = can_rescale ? resolution.up_scale : 1;
             const u32 down_shift = can_rescale ? resolution.down_shift : 0;
             auto copies = MakeShrinkImageCopies(new_info, overlap.info, base, up_scale, down_shift);
+            // F1 (CopyDep): the actual shrink copy; d = copy-region count, NOT bytes.
             if (overlap.info.num_samples != new_image.info.num_samples) {
                 runtime.CopyImageMSAA(new_image, overlap, copies);
+                Common::DiagTrace::Emit(Common::DiagTrace::Ev::CopyDep, frame_tick,
+                                        DiagTraceObjOf(copy_object.id), diag_trace_obj,
+                                        static_cast<u64>(copies.size()), 0, "join-shrink-msaa");
             } else {
                 runtime.CopyImage(new_image, overlap, copies);
+                Common::DiagTrace::Emit(Common::DiagTrace::Ev::CopyDep, frame_tick,
+                                        DiagTraceObjOf(copy_object.id), diag_trace_obj,
+                                        static_cast<u64>(copies.size()), 0, "join-shrink");
             }
             new_image.modification_tick = overlap.modification_tick;
         }
@@ -2785,16 +2817,6 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
             Common::DiagTrace::Emit(Common::DiagTrace::Ev::RelatedEvict, frame_tick,
                                     dit->second.trace_obj, diag_trace_obj,
                                     dit->second.gpu_addr, 0, diag_evict_tag);
-        }
-        // F1 (CopyDep): the join-copy data dependency with real identity at
-        // both ends. NOTE: the review's BlitImage-layer emit is NOT done -
-        // that layer carries Vulkan handles, not texture-cache identities;
-        // this covers the texture-cache copy dependencies that have identity.
-        if (const auto dit = diag_images_.find(copy_object.id.index);
-            dit != diag_images_.end()) {
-            Common::DiagTrace::Emit(Common::DiagTrace::Ev::CopyDep, frame_tick,
-                                    dit->second.trace_obj, diag_trace_obj,
-                                    new_image.guest_size_bytes, 0);
         }
         if (copy_object.resize) {
             MakeDormant(copy_object.id);

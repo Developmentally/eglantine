@@ -84,7 +84,17 @@ enum class Ev : u8 {
     DescRoute,       // a=draw_seq b=route(0=descbuf 1=push 2=updset 255=null-pipeline)
                      // c=num_entries d=reused_allocation (inside record lambda)
     RTBind,          // a=draw_seq b=image_trace_obj c=rt_index d=is_depth
-    CopyDep,         // a=frame b=src_trace_obj c=dst_trace_obj d=size
+                     // tag: v<view slot> g<view gen> (view lineage of the bound RT)
+                     // CHUNK-BATCH GAP: with EDEN_NX2_CHUNK_BATCH=1, batched draws skip
+                     // ConfigureDraw entirely - no Draw events (silent consumed seqs) and
+                     // the batch GetFramebuffer fires at flush under a DIFFERENT draw's
+                     // seq, misattributing RTBind. Diagnostic captures REQUIRE the
+                     // default (unset) mode; the run manifest must record the actual env
+    CopyDep,         // a=src_trace_obj b=dst_trace_obj c=copy-region count/layers
+                     // (0 = no count at that site; NEVER a byte claim) tag=route
+                     // (join-alias/join-resize/join-shrink[-msaa]/blit). Only the
+                     // named routes are covered: alias-driven CopyImage outside the
+                     // join and the EmulateCopyImage path are NOT covered
     BufEpoch,        // a=write_epoch b=device_addr c=size
     HrwSeed,         // a=core b=page c=address d=size
     HrwSkip,         // a=core b=page c=address d=size (shortcut hit, OnCPUWrite not called)
@@ -101,7 +111,11 @@ enum class Ev : u8 {
                      // window opening); deleted pre-window records are counted, not listed,
                      // and their erase events are OUTSIDE the capture - the snapshot plus
                      // the window does NOT give full lineage. Skip counters are cumulative
-                     // SINCE INIT, not window-only
+                     // SINCE INIT, not window-only. COMPLETENESS TEST: presence of the
+                     // identity-snapshot-states Config line - a budget halt mid-snapshot
+                     // can lose BOTH Config events. Chunk flushes bound but do NOT
+                     // guarantee against loss (concurrent emitters, ring churn); losses
+                     // are counted in dropped[], never prevented
     ImageDormant,    // a=trace_obj b=slot c=gpu_addr d=created_frame tag=encoded asid
     Count
 };
@@ -510,7 +524,18 @@ inline void Flush(u64 frame, const char* why) noexcept {
     } catch (...) {
         State& s = S();
         s.observer_errors.fetch_add(1, std::memory_order_relaxed);
-        s.flush_broken.store(true, std::memory_order_relaxed);
+        if (!s.flush_broken.exchange(true, std::memory_order_relaxed)) {
+            // Best-effort one-time notice: without it a first-flush fault was
+            // silent forever (flush_broken and the drops only lived in
+            // counters no successful flush would print). The flush path just
+            // faulted, so logging itself can fail - contained, never counted.
+            try {
+                LOG_CRITICAL(HW_GPU,
+                             "T3TRACE flush faulted; flush_broken latched, future flushes "
+                             "skipped, buffered events remain in the ring");
+            } catch (...) {
+            }
+        }
     }
 }
 
