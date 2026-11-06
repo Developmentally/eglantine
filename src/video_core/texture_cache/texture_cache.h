@@ -507,18 +507,38 @@ void TextureCache<P>::TickFrame() {
         // Observer-only containment: a fault here can never escape TickFrame.
         Common::DiagTrace::Observe([&] {
             diag_snapshot_done = true;
+            // D7: state-1 (deleted) records are skipped - their lineage is
+            // already evidenced by ImageErase - and COUNTED, reported in the
+            // follow-up Config event. The burst is chunked with intermediate
+            // flushes so a large table cannot overflow the ring in one burst.
+            u64 diag_snap_emitted = 0;
+            u64 diag_snap_deleted_skipped = 0;
             for (const auto& [slot, rec] : diag_images_) {
+                if (rec.state == 1) {
+                    ++diag_snap_deleted_skipped;
+                    continue;
+                }
                 char diag_tag[40];
                 // asid tags print MemoryManager id + 1; 0 would mean untracked.
                 std::snprintf(diag_tag, sizeof(diag_tag), "gen%u as%llx", rec.generation,
                               (unsigned long long)(rec.asid + 1));
                 Common::DiagTrace::Emit(Common::DiagTrace::Ev::IdentitySnap, frame_tick,
                                         rec.trace_obj, slot, rec.gpu_addr, rec.state, diag_tag);
+                if (++diag_snap_emitted % 1024 == 0) {
+                    Common::DiagTrace::Flush(frame_tick, "identity-snap-chunk");
+                }
             }
             Common::DiagTrace::Emit(Common::DiagTrace::Ev::Config, frame_tick,
-                                    diag_images_.size(), diag_identity_skipped,
-                                    diag_view_gen_.size(), diag_view_gen_skipped,
+                                    diag_images_.size(),
+                                    Common::DiagTrace::S().identity_skipped.load(
+                                        std::memory_order_relaxed),
+                                    diag_view_gen_.size(),
+                                    Common::DiagTrace::S().view_gen_skipped.load(
+                                        std::memory_order_relaxed),
                                     "identity-snapshot-done");
+            Common::DiagTrace::Emit(Common::DiagTrace::Ev::Config, frame_tick,
+                                    diag_snap_emitted, diag_snap_deleted_skipped, 0, 0,
+                                    "identity-snapshot-states");
         });
     }
 
@@ -1957,7 +1977,7 @@ ImageViewId TextureCache<P>::CreateImageView(const TICEntry& raw_config) {
                 diag_view_gen_.contains(buffer_view_id.index)) {
                 diag_view_gen_[buffer_view_id.index] = vgen;
             } else {
-                ++diag_view_gen_skipped;
+                Common::DiagTrace::S().view_gen_skipped.fetch_add(1, std::memory_order_relaxed);
             }
             Common::DiagTrace::Emit(Common::DiagTrace::Ev::ViewCreate, frame_tick,
                                     buffer_view_id.index, 0, vgen,
@@ -2547,7 +2567,7 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
                 diag_images_[new_image_id.index] =
                     DiagImageRec{diag_trace_obj, gpu_addr, frame_tick, 0, 0, diag_asid};
             } else {
-                ++diag_identity_skipped;
+                Common::DiagTrace::S().identity_skipped.fetch_add(1, std::memory_order_relaxed);
             }
             char diag_revive_tag[48];
             std::snprintf(diag_revive_tag, sizeof(diag_revive_tag), "no-prior-record as%llx",
@@ -2563,7 +2583,7 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
             diag_images_[new_image_id.index] =
                 DiagImageRec{diag_trace_obj, gpu_addr, frame_tick, 0, 0, diag_asid};
         } else {
-            ++diag_identity_skipped;
+            Common::DiagTrace::S().identity_skipped.fetch_add(1, std::memory_order_relaxed);
         }
         // D9: flags at construction (Sparse is OR-ed in after this emit); D2: ASID.
         char diag_shape[64];
@@ -3364,7 +3384,7 @@ ImageViewId TextureCache<P>::FindOrEmplaceImageView(ImageId image_id, const Imag
             diag_view_gen_[image_view_id.index] = vgen;
             diag_vgen = vgen;
         } else {
-            ++diag_view_gen_skipped;
+            Common::DiagTrace::S().view_gen_skipped.fetch_add(1, std::memory_order_relaxed);
         }
     });
     Common::DiagTrace::Emit(Common::DiagTrace::Ev::ViewCreate, frame_tick,

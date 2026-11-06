@@ -66,6 +66,10 @@ namespace Common::DiagTrace {
 enum class Ev : u8 {
     ImageCreate = 0, // a=trace_obj b=slot_index c=gpu_addr d=byte_size tag=format/type/levels/layers
     ImageErase,      // a=trace_obj b=slot_index c=gpu_addr d=created_frame
+                     // tag: as<manager-id+1> c=<cause> r=<disposition AT SLOT FREE>:
+                     // retained/immediate/sentenced is NOT the backing-release time
+                     // (sentenced-ring pop and retained-download completion emit no
+                     // event) - never infer VRAM release from this line
     ImageRevive,     // a=trace_obj(SAME object) b=slot_index c=gpu_addr d=generation tag=lifetime
     RelatedEvict,    // a=old_trace_obj b=new_trace_obj c=old_gpu_addr tag=relation (eviction
                      // relation, NOT proven same semantic object)
@@ -115,6 +119,8 @@ struct State {
     std::atomic<u64> attempted{0};
     std::atomic<u64> skipped_window{0};
     std::atomic<u64> tag_truncated{0}; // descriptor tags that did not fit their field
+    std::atomic<u64> identity_skipped{0}; // image-identity records dropped at the capacity bound
+    std::atomic<u64> view_gen_skipped{0};  // view-gen entries dropped at the capacity bound
     std::atomic<u64> observer_errors{0}; // contained observer faults (NOT overflow victims)
     std::atomic<u64> late_after_halt{0}; // arrivals after the capture boundary
     std::atomic<u64> init_runs{0}; // times the init lambda body ran (must stay 1)
@@ -396,13 +402,18 @@ inline std::string CounterSummary() {
             out += fmt::format(" {}={}/drop{}", ClsName(static_cast<u32>(i)), em, dr);
         }
     }
+    // identity/view-gen skip counters repeat in EVERY flush summary (D7), not
+    // just in the one-time snapshot Config event.
     out += fmt::format(
-        " attempted={} skipped_window={} tag_truncated={} observer_errors={} late_after_halt={}",
+        " attempted={} skipped_window={} tag_truncated={} observer_errors={} late_after_halt={}"
+        " identity_skipped={} view_gen_skipped={}",
         S().attempted.load(std::memory_order_relaxed),
         S().skipped_window.load(std::memory_order_relaxed),
         S().tag_truncated.load(std::memory_order_relaxed),
         S().observer_errors.load(std::memory_order_relaxed),
-        S().late_after_halt.load(std::memory_order_relaxed));
+        S().late_after_halt.load(std::memory_order_relaxed),
+        S().identity_skipped.load(std::memory_order_relaxed),
+        S().view_gen_skipped.load(std::memory_order_relaxed));
     if (S().init_broken.load(std::memory_order_relaxed)) {
         out += " init_broken=1";
     }
