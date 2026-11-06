@@ -147,6 +147,10 @@ jobs:
             --output appimage
           test -s "$LDAI_OUTPUT"
           ls -la "$LDAI_OUTPUT"
+          # eglantine test 3 (this branch): the diagnostic build ships under
+          # its friendly name, which the test3 launcher looks up explicitly.
+          cp "$LDAI_OUTPUT" "eglantine test 3.AppImage"
+          ls -la "eglantine test 3.AppImage"
 
       # The launcher script and the settings file the fork is measured with (docs/user/
       # SteamDeckAppImage.md); unversioned so the guide's download instructions stay the same.
@@ -154,7 +158,10 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          tar -czf eglantine-steamdeck-kit.tar.gz -C dist/steamdeck eglantine-deck.sh eglantine-deck.ini
+          # eglantine test 3 (this branch): the diagnostic launcher plus a
+          # verbatim copy of the working settings as its separate ini.
+          cp dist/steamdeck/eglantine-deck.ini dist/steamdeck/eglantine-test3.ini
+          tar -czf eglantine-steamdeck-kit.tar.gz -C dist/steamdeck             eglantine-deck.sh eglantine-deck.ini             eglantine-test3.sh eglantine-test3.ini README-test3.txt
           tar -tzf eglantine-steamdeck-kit.tar.gz
 
       - name: Upload binaries
@@ -165,6 +172,7 @@ jobs:
             eglantine-steamdeck-*.tar.gz
             eglantine-steamdeck-*.AppImage
             eglantine-steamdeck-kit.tar.gz
+            eglantine test 3.AppImage
           if-no-files-found: error
           compression-level: 0
           retention-days: 14
