@@ -154,6 +154,20 @@ TEST_CASE("GPUDirtyMemoryManager: empty gather reports nothing", "[gpu_dirty]") 
 
 namespace {
 
+class ChainTestBuffer; // fwd for the runtime surface
+
+// Staging-buffer stand-in for the real mapped upload path: MappedUploadMemory
+// fills mapped_span via the REAL DeviceMemoryManager::ReadBlockUnsafe, then
+// calls runtime.CopyBuffer. Capturing these bytes IS the delivery evidence.
+struct ChainStaging {
+    std::vector<u8> data;
+};
+struct ChainUpload {
+    ChainStaging* buffer;
+    u64 offset;
+    std::span<u8> mapped_span;
+};
+
 class ChainTestRuntime {
 public:
     bool CanReportMemoryUsage() const {
@@ -164,6 +178,30 @@ public:
     u64 GetDeviceLocalMemory() const {
         return 8ULL << 30;
     }
+    u64 CurrentTick() {
+        return ++tick;
+    }
+    ChainUpload UploadStagingBuffer(u64 total_size_bytes) {
+        staging.data.assign(static_cast<size_t>(total_size_bytes), 0);
+        return {&staging, 0, std::span<u8>(staging.data)};
+    }
+    bool CanReorderUpload(ChainTestBuffer&, std::span<VideoCommon::BufferCopy>) {
+        return false;
+    }
+    bool IsFree(u64) {
+        return true;
+    }
+    void Wait(u64) {}
+    // Real memcpy delivery of the staged bytes into the buffer's host backing.
+    void CopyBuffer(ChainTestBuffer& dst, ChainStaging* src,
+                    std::span<VideoCommon::BufferCopy> copies, bool, bool);
+    // Buffer-to-buffer copy (used by SplitBuffer paths); same memcpy model.
+    template <typename Copies>
+    void CopyBuffer(ChainTestBuffer& dst, ChainTestBuffer& src, const Copies& copies, bool);
+    void ClearBuffer(ChainTestBuffer& dst, u64 offset, u64 size, u32 value);
+
+    u64 tick = 0;
+    ChainStaging staging;
 };
 
 class ChainTestBuffer : public VideoCommon::BufferBase {
@@ -172,12 +210,47 @@ public:
     ChainTestBuffer(ChainTestRuntime&, VAddr cpu_addr_, u64 size_bytes_)
         : BufferBase(cpu_addr_, size_bytes_) {
         host.assign(size_bytes_, 0);
+        cpu_addr_cached = cpu_addr_;
     }
 
     // Host-observable backing; stands in for the mapped GPU buffer the real
     // upload path would copy into.
     std::vector<u8> host;
+
+    ChainTestBuffer(ChainTestRuntime& r, VAddr cpu_addr_, u32 size_, bool)
+        : ChainTestBuffer(r, cpu_addr_, static_cast<u64>(size_)) {
+        cpu_addr_cached = cpu_addr_;
+    }
+
+    void setWriteTick(u64 t) {
+        write_tick = t;
+    }
+    u64 getWriteTick() const {
+        return write_tick;
+    }
+    void MarkUsage(u64, u64) {}
+    u64 write_tick = 0;
+    VAddr cpu_addr_cached = 0; // a field in the real Buffer, not a method
 };
+
+inline void ChainTestRuntime::CopyBuffer(ChainTestBuffer& dst, ChainStaging* src,
+                                         std::span<VideoCommon::BufferCopy> copies, bool, bool) {
+    for (const auto& c : copies) {
+        std::memcpy(dst.host.data() + c.dst_offset, src->data.data() + c.src_offset, c.size);
+    }
+}
+
+template <typename Copies>
+inline void ChainTestRuntime::CopyBuffer(ChainTestBuffer& dst, ChainTestBuffer& src,
+                                         const Copies& copies, bool) {
+    for (const auto& c : copies) {
+        std::memcpy(dst.host.data() + c.dst_offset, src.host.data() + c.src_offset, c.size);
+    }
+}
+
+inline void ChainTestRuntime::ClearBuffer(ChainTestBuffer& dst, u64 offset, u64 size, u32 value) {
+    std::memset(dst.host.data() + offset, static_cast<int>(value), static_cast<size_t>(size));
+}
 
 struct ChainTestParams {
     using Runtime = ChainTestRuntime;
@@ -614,12 +687,20 @@ struct Core::DeviceMemoryManagerTestAccess {
                 static_cast<u32>(start_page_d + i);
         }
         m.translation_generation.fetch_add(1, std::memory_order_release);
+        // Test-only rigor: the packed cpu_backing_address must round-trip
+        // (guards the guest_mask/ASID packing, which ReadBlockUnsafe never
+        // inspects).
+        for (size_t i = 0; i < num_pages; i++) {
+            const auto [pk_asid, pk_vaddr] = m.ExtractCPUBacking(start_page_d + i);
+            REQUIRE(pk_asid.id == asid.id);
+            REQUIRE(pk_vaddr == virtual_address + i * Core::Memory::YUZU_PAGESIZE);
+        }
     }
 };
 
 namespace {
 constexpr DAddr kSeamDev = 0x0000'0004'0000; // device address of the mapped span
-constexpr VAddr kSeamGuest = 0x0000'4000'0000'0000; // unique per case (TLS Translations reuse)
+constexpr VAddr kSeamGuest = 0x0000'0000'4000'0000; // 2^38 < 2^39 // < 2^39 (guest_mask), nonzero, page-aligned, unique per case
 constexpr PAddr kSeamPhys = 0x0000'0020'0000; // offset inside the DeviceMemory backing
 constexpr u64 kSeamWindow = 4096; // one page
 } // namespace
@@ -649,4 +730,145 @@ TEST_CASE("Criterion2 seam: MapForTest round-trips through real ReadBlockUnsafe"
     gmmu.WriteBlockUnsafe(kSeamDev + 128, in.data(), in.size());
     REQUIRE(std::memcmp(backing.GetPointerFromRaw<u8>(kSeamPhys + 128), in.data(),
                         in.size()) == 0);
+}
+
+namespace {
+// Shared driver for the real consumer leg. When skip_collect_on_hit is true the
+// hit-branch Collect is suppressed (the sensitive negative control).
+// Each case MUST get a distinct DAddr span: TLS Translations() is keyed by
+// (owner pointer, generation, DAddr guest page), and a fresh gmmu reuses the
+// same stack address and generation across cases - same-DAddr cases would read
+// the previous case's stale host pointer (observed: control run first poisoned
+// the main case's step-3 upload). Distinct DAddr pages = distinct TLS keys.
+template <typename F>
+void RunConsumerCase(bool skip_collect_on_hit, DAddr kConsDev, VAddr kConsGuest,
+                     F&& final_check) {
+    constexpr PAddr kConsPhys = 0x0000'0030'0000;
+    constexpr u64 kSpan = 65536;
+    constexpr u64 kRegion = 64;
+
+    Core::DeviceMemory backing;
+    Tegra::MaxwellDeviceMemoryManager gmmu{backing};
+    gmmu.RegisterProcess(nullptr); // one slot; abort stubs trip on any deref
+    const Core::Asid asid{.id = 0};
+    struct ResolverCtx {
+        Core::DeviceMemory* mem;
+        VAddr guest_base;
+    } rctx{&backing, kConsGuest};
+    const auto resolver = +[](void* ctx, VAddr v) -> u8* {
+        auto* rc = static_cast<ResolverCtx*>(ctx);
+        return rc->mem->template GetPointerFromRaw<u8>(kConsPhys + (v - rc->guest_base));
+    };
+    Core::DeviceMemoryManagerTestAccess::MapForTest(gmmu, kConsDev, kConsGuest, kSpan, asid,
+                                                    resolver, &rctx);
+
+    ChainTestRuntime runtime;
+    VideoCommon::BufferCache<ChainTestParams> cache{gmmu, runtime};
+    Core::GPUDirtyMemoryManager manager;
+    u8* const host_page = backing.GetPointerFromRaw<u8>(kConsPhys);
+
+    PAddr gate_last_address = 0; // matches value-initialized rasterizer_write_areas
+    unsigned on_cpu_write_calls = 0;
+    unsigned collect_calls = 0;
+    unsigned drain_writes = 0;
+
+    // REAL cache.OnCPUWrite through the gate (production wiring), with a
+    // counting wrapper so the hit-branch skip is directly observable.
+    const auto on_cpu_write = [&](DAddr a, u64 s) {
+        ++on_cpu_write_calls;
+        return cache.OnCPUWrite(a, s);
+    };
+    const auto collect = [&](DAddr a, u64 s) {
+        ++collect_calls;
+        manager.Collect(a, s);
+    };
+    const auto skip_collect = [&](DAddr, u64) {};
+    unsigned gate_calls = 0;
+    const auto drive_gate = [&](PAddr paddr, u64 size) {
+        std::function<bool(DAddr, u64)> cb_write = on_cpu_write;
+        // The control suppresses Collect ONLY on the hit-path write (the
+        // second gate touch); the first miss-path write must still collect,
+        // or value2 never drains and the control stops being sensitive.
+        const bool suppress = skip_collect_on_hit && gate_calls > 0;
+        std::function<void(DAddr, u64)> cb_collect =
+            suppress ? std::function<void(DAddr, u64)>(skip_collect)
+                     : std::function<void(DAddr, u64)>(collect);
+        ++gate_calls;
+        Core::HandleRasterizerWriteGate(gate_last_address,
+                                        paddr >> Core::Memory::YUZU_PAGEBITS, paddr, size, 0,
+                                        cb_write, cb_collect);
+    };
+    // REAL drain consumer: GPU::InvalidateGPUCache -> BufferCache::WriteMemory.
+    const auto gather = [&] {
+        std::function<void(PAddr, size_t)> drain = [&](PAddr a, size_t s) {
+            ++drain_writes;
+            cache.WriteMemory(a, static_cast<u64>(s));
+        };
+        manager.Gather(drain);
+    };
+    const auto sync_and_mark = [&] {
+        auto [buf, off] =
+            cache.ObtainCPUBuffer(kConsDev, kRegion,
+                                  VideoCommon::ObtainBufferSynchronize::FullSynchronize,
+                                  VideoCommon::ObtainBufferOperation::MarkAsWritten);
+        return std::pair{static_cast<ChainTestBuffer*>(buf), off};
+    };
+
+    // Step 1: initial value1, CPU-marked, delivered by the real upload path,
+    // then GPU-marked (the OnCPUWrite TRUE-branch precondition).
+    std::memset(host_page, 0x11, kRegion);
+    cache.WriteMemory(kConsDev, kRegion);
+    auto* buf = sync_and_mark().first;
+    REQUIRE(buf->host.size() >= kRegion);
+    REQUIRE(std::all_of(buf->host.begin(), buf->host.begin() + kRegion,
+                        [](u8 b) { return b == 0x11; }));
+    REQUIRE(cache.IsRegionGpuModified(kConsDev, kRegion));
+
+    // Step 2: first write value2 through the gate -> real OnCPUWrite TRUE
+    // branch, no cache marks (deferred), seeded + collected.
+    std::memset(host_page, 0x22, kRegion);
+    drive_gate(kConsDev, kRegion);
+    REQUIRE(on_cpu_write_calls == 1);
+    REQUIRE(collect_calls == 1);
+
+    // Step 3: real Gather -> real WriteMemory -> real full sync delivers
+    // value2 and leaves the range clean.
+    gather();
+    buf = sync_and_mark().first;
+    REQUIRE(std::all_of(buf->host.begin(), buf->host.begin() + kRegion,
+                        [](u8 b) { return b == 0x22; }));
+    REQUIRE(cache.IsRegionGpuModified(kConsDev, kRegion)); // re-marked by sync_and_mark
+
+    // Step 4: second write value3 on the SAME bytes/page -> gate hit branch
+    // skips OnCPUWrite; only Collect records it.
+    const unsigned calls_before = on_cpu_write_calls;
+    std::memset(host_page, 0x33, kRegion);
+    drive_gate(kConsDev, kRegion);
+    REQUIRE(on_cpu_write_calls == calls_before); // unchanged: the skip fired
+
+    // Step 5: fresh collect/drain -> full sync. With the real chain, value3
+    // MUST be delivered; with Collect suppressed it MUST NOT.
+    gather();
+    buf = sync_and_mark().first;
+    final_check(*buf, drain_writes);
+}
+} // namespace
+
+TEST_CASE("Criterion2 consumer: deferred second same-page write reaches the real buffer",
+          "[gpu_dirty]") {
+    RunConsumerCase(false, 0x0000'0000'0100'0000, 0x0000'0002'0000'0000,
+                    [](ChainTestBuffer& buf, unsigned drain_writes) {
+        REQUIRE(drain_writes >= 2);
+        REQUIRE(std::all_of(buf.host.begin(), buf.host.begin() + 64,
+                            [](u8 b) { return b == 0x33; }));
+    });
+}
+
+TEST_CASE("Criterion2 consumer control: without the skip-path Collect the write is lost",
+          "[gpu_dirty]") {
+    RunConsumerCase(true, 0x0000'0000'0200'0000, 0x0000'0003'0000'0000,
+                    [](ChainTestBuffer& buf, unsigned) {
+        REQUIRE(std::all_of(buf.host.begin(), buf.host.begin() + 64,
+                            [](u8 b) { return b == 0x22; }));
+    });
 }
