@@ -91,10 +91,15 @@ enum class Ev : u8 {
                      // seq, misattributing RTBind. Diagnostic captures REQUIRE the
                      // default (unset) mode; the run manifest must record the actual env
     CopyDep,         // a=src_trace_obj b=dst_trace_obj c=copy-region count/layers
-                     // (0 = no count at that site; NEVER a byte claim) tag=route
-                     // (join-alias/join-resize/join-shrink[-msaa]/blit). Only the
-                     // named routes are covered: alias-driven CopyImage outside the
-                     // join and the EmulateCopyImage path are NOT covered
+                     // (0 = no count at that site; NEVER a byte claim) tag=route.
+                     // Emitted AT the actual issue route, never on a request:
+                     // copy-direct/copy-emulated/copy-reinterpret/copy-convert
+                     // (inside the CopyImage wrapper, after the astc_opaque no-copy
+                     // return; the tag names the route, not the caller - covers
+                     // join-alias, SynchronizeAliases and all other wrapper
+                     // callers), join-resize/join-shrink[-msaa] (direct runtime
+                     // calls in the join), blit (TextureCache::BlitImage issue
+                     // point). CopyImageMSAA outside the join is NOT covered
     BufEpoch,        // a=write_epoch b=device_addr c=size
     HrwSeed,         // a=core b=page c=address d=size
     HrwSkip,         // a=core b=page c=address d=size (shortcut hit, OnCPUWrite not called)
@@ -111,11 +116,14 @@ enum class Ev : u8 {
                      // window opening); deleted pre-window records are counted, not listed,
                      // and their erase events are OUTSIDE the capture - the snapshot plus
                      // the window does NOT give full lineage. Skip counters are cumulative
-                     // SINCE INIT, not window-only. COMPLETENESS TEST: presence of the
-                     // identity-snapshot-states Config line - a budget halt mid-snapshot
-                     // can lose BOTH Config events. Chunk flushes bound but do NOT
-                     // guarantee against loss (concurrent emitters, ring churn); losses
-                     // are counted in dropped[], never prevented
+                     // SINCE INIT, not window-only. COMPLETENESS TEST (all required):
+                     // the identity-snapshot-states Config line is present AND
+                     // dropped[IdentitySnap]==0 in the NEXT successful flush summary
+                     // AND no flush_broken/observer_errors. Marker presence alone is
+                     // NOT sufficient (reproduced: marker printed with 4858 snapshot
+                     // drops under concurrent emitters). Backend losses (log filter,
+                     // file cap) are uncounted. Chunk flushes bound but never
+                     // guarantee against loss; losses are counted, not prevented
     ImageDormant,    // a=trace_obj b=slot c=gpu_addr d=created_frame tag=encoded asid
     Count
 };

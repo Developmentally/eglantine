@@ -2743,10 +2743,6 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
             }
             const AliasedImage& aliased = new_image.aliased_images[alias_pointer->second];
             CopyImage(new_image_id, aliased.id, aliased.copies);
-            // F1 (CopyDep): the actual alias copy; d = copy-region count, NOT bytes.
-            Common::DiagTrace::Emit(Common::DiagTrace::Ev::CopyDep, frame_tick,
-                                    DiagTraceObjOf(aliased.id), diag_trace_obj,
-                                    static_cast<u64>(aliased.copies.size()), 0, "join-alias");
             new_image.modification_tick = overlap.modification_tick;
             continue;
         }
@@ -4061,19 +4057,36 @@ void TextureCache<P>::CopyImage(ImageId dst_id, ImageId src_id, std::vector<Imag
     }
     const auto dst_format_type = GetFormatType(dst.info.format);
     const auto src_format_type = GetFormatType(src.info.format);
+    // F1 (CopyDep): emitted at the actual issue route, AFTER the astc_opaque
+    // early return (which uploads from guest memory instead - no copy, no
+    // event). c = copy-region count, NOT bytes. The tag names the ROUTE, not
+    // the caller (join-alias, SynchronizeAliases and every other caller all
+    // flow through here).
     if (src_format_type == dst_format_type) {
         if constexpr (HAS_EMULATED_COPIES) {
             if (!runtime.CanImageBeCopied(dst, src)) {
+                Common::DiagTrace::Emit(Common::DiagTrace::Ev::CopyDep, frame_tick,
+                                        DiagTraceObjOf(src_id), DiagTraceObjOf(dst_id),
+                                        static_cast<u64>(copies.size()), 0, "copy-emulated");
                 return runtime.EmulateCopyImage(dst, src, copies);
             }
         }
+        Common::DiagTrace::Emit(Common::DiagTrace::Ev::CopyDep, frame_tick,
+                                DiagTraceObjOf(src_id), DiagTraceObjOf(dst_id),
+                                static_cast<u64>(copies.size()), 0, "copy-direct");
         return runtime.CopyImage(dst, src, copies);
     }
     UNIMPLEMENTED_IF(dst.info.type != ImageType::e2D);
     UNIMPLEMENTED_IF(src.info.type != ImageType::e2D);
     if (runtime.ShouldReinterpret(dst, src)) {
+        Common::DiagTrace::Emit(Common::DiagTrace::Ev::CopyDep, frame_tick,
+                                DiagTraceObjOf(src_id), DiagTraceObjOf(dst_id),
+                                static_cast<u64>(copies.size()), 0, "copy-reinterpret");
         return runtime.ReinterpretImage(dst, src, copies);
     }
+    Common::DiagTrace::Emit(Common::DiagTrace::Ev::CopyDep, frame_tick,
+                            DiagTraceObjOf(src_id), DiagTraceObjOf(dst_id),
+                            static_cast<u64>(copies.size()), 0, "copy-convert");
     for (const ImageCopy& copy : copies) {
         UNIMPLEMENTED_IF(copy.dst_subresource.num_layers != 1);
         UNIMPLEMENTED_IF(copy.src_subresource.num_layers != 1);
