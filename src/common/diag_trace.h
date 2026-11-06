@@ -457,7 +457,9 @@ inline void EmitImpl(Ev cls, u64 frame, u64 a, u64 b, u64 c, u64 d, const char* 
     e.b = b;
     e.c = c;
     e.d = d;
-    std::snprintf(e.tag, sizeof(e.tag), "%s", tag);
+    // Precision-bounded on purpose: tags are capped at the field size, and
+    // the bound must be visible to -Wformat-truncation (CI -Werror=all).
+    std::snprintf(e.tag, sizeof(e.tag), "%.*s", static_cast<int>(sizeof(e.tag) - 1), tag);
     ++s.head;
     s.emitted[i].fetch_add(1, std::memory_order_relaxed);
 }
