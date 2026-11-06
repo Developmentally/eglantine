@@ -182,6 +182,7 @@ public:
         return ++tick;
     }
     ChainUpload UploadStagingBuffer(u64 total_size_bytes) {
+        ++staging_calls;
         staging.data.assign(static_cast<size_t>(total_size_bytes), 0);
         return {&staging, 0, std::span<u8>(staging.data)};
     }
@@ -201,6 +202,7 @@ public:
     void ClearBuffer(ChainTestBuffer& dst, u64 offset, u64 size, u32 value);
 
     u64 tick = 0;
+    u64 staging_calls = 0;
     ChainStaging staging;
 };
 
@@ -696,11 +698,28 @@ struct Core::DeviceMemoryManagerTestAccess {
             REQUIRE(pk_vaddr == virtual_address + i * Core::Memory::YUZU_PAGESIZE);
         }
     }
+
+    // Test-only TLS isolation: t_cache is a static thread_local shared across
+    // cases in one process; distinct DAddr spans key it apart, but reset it
+    // explicitly so repeated same-case runs cannot reuse a stale host pointer.
+    template <typename Traits>
+    static void ResetTranslationCacheForTest(Core::DeviceMemoryManager<Traits>&) {
+        Core::DeviceMemoryManager<Traits>::t_cache =
+            typename Core::DeviceMemoryManager<Traits>::TranslationCache{};
+    }
+
+    // Cached-count branch precondition: exactly one registered slot, and it is
+    // the nullptr process (the abort stubs trip on any deref).
+    template <typename Traits>
+    static void RequireSingleNullProcessForTest(Core::DeviceMemoryManager<Traits>& m) {
+        REQUIRE(m.registered_processes.size() == 1);
+        REQUIRE(m.registered_processes[0] == nullptr);
+    }
 };
 
 namespace {
 constexpr DAddr kSeamDev = 0x0000'0004'0000; // device address of the mapped span
-constexpr VAddr kSeamGuest = 0x0000'0000'4000'0000; // 2^38 < 2^39 // < 2^39 (guest_mask), nonzero, page-aligned, unique per case
+constexpr VAddr kSeamGuest = 0x0000'0000'4000'0000; // 2^30 < 2^39 (guest_mask) // < 2^39 (guest_mask), nonzero, page-aligned, unique per case
 constexpr PAddr kSeamPhys = 0x0000'0020'0000; // offset inside the DeviceMemory backing
 constexpr u64 kSeamWindow = 4096; // one page
 } // namespace
@@ -761,6 +780,8 @@ void RunConsumerCase(bool skip_collect_on_hit, DAddr kConsDev, VAddr kConsGuest,
     };
     Core::DeviceMemoryManagerTestAccess::MapForTest(gmmu, kConsDev, kConsGuest, kSpan, asid,
                                                     resolver, &rctx);
+    Core::DeviceMemoryManagerTestAccess::ResetTranslationCacheForTest(gmmu);
+    Core::DeviceMemoryManagerTestAccess::RequireSingleNullProcessForTest(gmmu);
 
     ChainTestRuntime runtime;
     VideoCommon::BufferCache<ChainTestParams> cache{gmmu, runtime};
@@ -770,7 +791,7 @@ void RunConsumerCase(bool skip_collect_on_hit, DAddr kConsDev, VAddr kConsGuest,
     PAddr gate_last_address = 0; // matches value-initialized rasterizer_write_areas
     unsigned on_cpu_write_calls = 0;
     unsigned collect_calls = 0;
-    unsigned drain_writes = 0;
+    std::vector<std::pair<PAddr, size_t>> drains;
 
     // REAL cache.OnCPUWrite through the gate (production wiring), with a
     // counting wrapper so the hit-branch skip is directly observable.
@@ -801,24 +822,37 @@ void RunConsumerCase(bool skip_collect_on_hit, DAddr kConsDev, VAddr kConsGuest,
     // REAL drain consumer: GPU::InvalidateGPUCache -> BufferCache::WriteMemory.
     const auto gather = [&] {
         std::function<void(PAddr, size_t)> drain = [&](PAddr a, size_t s) {
-            ++drain_writes;
+            drains.emplace_back(a, s);
             cache.WriteMemory(a, static_cast<u64>(s));
         };
         manager.Gather(drain);
     };
+    // Initial obtain syncs AND GPU-marks: the OnCPUWrite TRUE-branch
+    // precondition (registered + GPU-modified) for the first deferred write.
     const auto sync_and_mark = [&] {
         auto [buf, off] =
             cache.ObtainCPUBuffer(kConsDev, kRegion,
                                   VideoCommon::ObtainBufferSynchronize::FullSynchronize,
                                   VideoCommon::ObtainBufferOperation::MarkAsWritten);
-        return std::pair{static_cast<ChainTestBuffer*>(buf), off};
+        REQUIRE(off == 0);
+        return static_cast<ChainTestBuffer*>(buf);
+    };
+    // Later obtains sync ONLY: no re-mark. The clean-between-writes state is
+    // asserted, not recreated.
+    const auto sync_only = [&] {
+        auto [buf, off] =
+            cache.ObtainCPUBuffer(kConsDev, kRegion,
+                                  VideoCommon::ObtainBufferSynchronize::FullSynchronize,
+                                  VideoCommon::ObtainBufferOperation::DoNothing);
+        REQUIRE(off == 0);
+        return static_cast<ChainTestBuffer*>(buf);
     };
 
     // Step 1: initial value1, CPU-marked, delivered by the real upload path,
     // then GPU-marked (the OnCPUWrite TRUE-branch precondition).
     std::memset(host_page, 0x11, kRegion);
     cache.WriteMemory(kConsDev, kRegion);
-    auto* buf = sync_and_mark().first;
+    auto* buf = sync_and_mark();
     REQUIRE(buf->host.size() >= kRegion);
     REQUIRE(std::all_of(buf->host.begin(), buf->host.begin() + kRegion,
                         [](u8 b) { return b == 0x11; }));
@@ -832,12 +866,15 @@ void RunConsumerCase(bool skip_collect_on_hit, DAddr kConsDev, VAddr kConsGuest,
     REQUIRE(collect_calls == 1);
 
     // Step 3: real Gather -> real WriteMemory -> real full sync delivers
-    // value2 and leaves the range clean.
+    // value2 and leaves the range CLEAN - CPU clean AND GPU clean, and NOT
+    // re-marked before the skipped second write (the sensitive precondition).
     gather();
-    buf = sync_and_mark().first;
+    buf = sync_only();
     REQUIRE(std::all_of(buf->host.begin(), buf->host.begin() + kRegion,
                         [](u8 b) { return b == 0x22; }));
-    REQUIRE(cache.IsRegionGpuModified(kConsDev, kRegion)); // re-marked by sync_and_mark
+    REQUIRE(!cache.IsRegionCpuModified(kConsDev, kRegion));
+    REQUIRE(!cache.IsRegionGpuModified(kConsDev, kRegion));
+    const u64 staging_after_clean = runtime.staging_calls;
 
     // Step 4: second write value3 on the SAME bytes/page -> gate hit branch
     // skips OnCPUWrite; only Collect records it.
@@ -846,19 +883,25 @@ void RunConsumerCase(bool skip_collect_on_hit, DAddr kConsDev, VAddr kConsGuest,
     drive_gate(kConsDev, kRegion);
     REQUIRE(on_cpu_write_calls == calls_before); // unchanged: the skip fired
 
-    // Step 5: fresh collect/drain -> full sync. With the real chain, value3
-    // MUST be delivered; with Collect suppressed it MUST NOT.
+    // Step 5: fresh collect/drain -> full sync (still no re-mark). With the
+    // real chain, value3 MUST be delivered; with Collect suppressed it MUST
+    // NOT.
     gather();
-    buf = sync_and_mark().first;
-    final_check(*buf, drain_writes);
+    buf = sync_only();
+    final_check(*buf, drains, collect_calls, runtime.staging_calls, staging_after_clean, cache);
 }
 } // namespace
 
 TEST_CASE("Criterion2 consumer: deferred second same-page write reaches the real buffer",
           "[gpu_dirty]") {
     RunConsumerCase(false, 0x0000'0000'0100'0000, 0x0000'0002'0000'0000,
-                    [](ChainTestBuffer& buf, unsigned drain_writes) {
-        REQUIRE(drain_writes >= 2);
+                    [](ChainTestBuffer& buf, const std::vector<std::pair<PAddr, size_t>>& drains,
+                       unsigned, u64, u64, VideoCommon::BufferCache<ChainTestParams>&) {
+        // Exactly two drains: one per collected write (steps 2 and 4).
+        REQUIRE(drains.size() == 2);
+        // The second drain covers the written 64 bytes.
+        REQUIRE(drains[1].first <= 0x0000'0000'0100'0000);
+        REQUIRE(drains[1].first + drains[1].second >= 0x0000'0000'0100'0000 + 64);
         REQUIRE(std::all_of(buf.host.begin(), buf.host.begin() + 64,
                             [](u8 b) { return b == 0x33; }));
     });
@@ -867,7 +910,17 @@ TEST_CASE("Criterion2 consumer: deferred second same-page write reaches the real
 TEST_CASE("Criterion2 consumer control: without the skip-path Collect the write is lost",
           "[gpu_dirty]") {
     RunConsumerCase(true, 0x0000'0000'0200'0000, 0x0000'0003'0000'0000,
-                    [](ChainTestBuffer& buf, unsigned) {
+                    [](ChainTestBuffer& buf, const std::vector<std::pair<PAddr, size_t>>& drains,
+                       unsigned collect_calls, u64 staging_calls, u64 staging_after_clean,
+                       VideoCommon::BufferCache<ChainTestParams>& cache) {
+        // The first (miss-path) write collected and drained exactly once...
+        REQUIRE(collect_calls == 1);
+        REQUIRE(drains.size() == 1);
+        // ...the suppressed hit-path Collect marked nothing new...
+        REQUIRE(!cache.IsRegionCpuModified(0x0000'0000'0200'0000, 64));
+        // ...and no upload re-ran (staging untouched since the clean state)...
+        REQUIRE(staging_calls == staging_after_clean);
+        // ...so the buffer still holds value2 and value3 was lost.
         REQUIRE(std::all_of(buf.host.begin(), buf.host.begin() + 64,
                             [](u8 b) { return b == 0x22; }));
     });
