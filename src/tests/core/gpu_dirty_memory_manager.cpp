@@ -161,6 +161,7 @@ TEST_CASE("GPUDirtyMemoryManager: empty gather reports nothing", "[gpu_dirty]") 
 
 #include "core/device_memory.h"
 #include "core/gpu_write_gate.h"
+#include "common/diag_trace.h"
 #include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/buffer_cache/memory_tracker_base.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
