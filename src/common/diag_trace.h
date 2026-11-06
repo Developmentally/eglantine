@@ -70,8 +70,9 @@ enum class Ev : u8 {
     RelatedEvict,    // a=old_trace_obj b=new_trace_obj c=old_gpu_addr tag=relation (eviction
                      // relation, NOT proven same semantic object)
     ViewCreate,      // a=view_slot b=image_trace_obj c=view_slot_generation d=view_type
+                     // (generation is in c here, but in d on ViewErase - read the right field)
     ViewCacheHit,    // a=view_slot b=image_trace_obj c=view_slot_generation
-    ViewErase,       // a=view_slot
+    ViewErase,       // a=view_slot d=erased generation (0 = unknown/cap-skipped, not "gen 0")
     Draw,            // a=draw_seq b=vertex_count c=instance_count d=indexed (in record lambda)
     DrawSkip,        // a=draw_seq tag=reason
     DescFinal,       // a=draw_seq b=ORIGINAL image_trace_obj (kept on substitution) c=view_slot d=final VkImageView handle; tag f=final kind k/n/o
@@ -91,7 +92,8 @@ enum class Ev : u8 {
     HrwCacheInval,   // a=address b=size (OnCacheInvalidation invoked - invalidation, not use)
     HrwUpload,       // a=buffer_cpu_addr b=device_addr c=size (actual upload copy)
     Config,          // a=kind b/c/d=value; tag=name
-    IdentitySnap,    // a=trace_obj b=slot c=gpu_addr d=state(0=live 1=deleted) tag=gen
+    IdentitySnap,    // a=trace_obj b=slot c=gpu_addr d=state(0=live 1=deleted 2=dormant) tag=gen
+    ImageDormant,    // a=trace_obj b=slot c=gpu_addr d=created_frame tag=encoded asid
     Count
 };
 
@@ -379,6 +381,7 @@ inline const char* ClsName(u32 cls) {
         "DescRoute",   "RTBind",      "CopyDep",     "BufEpoch",     "HrwSeed",
         "HrwSkip",     "HrwCollect",  "HrwBufAccept","HrwBufReject", "HrwGather",
         "HrwDrain",    "HrwCacheInval","HrwUpload",  "Config",       "IdentitySnap",
+        "ImageDormant",
     };
     return cls < names.size() ? names[cls] : "Unknown";
 }

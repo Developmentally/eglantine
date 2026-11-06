@@ -169,7 +169,7 @@ class TextureCache : public VideoCommon::ChannelSetupCaches<TextureCacheChannelI
         u64 gpu_addr = 0;
         u64 created_frame = 0;
         u32 generation = 0;  // bumped on each revive of the same object
-        u32 state = 0;       // 0=live 1=deleted(dormant-or-freed; record kept for lineage)
+        u32 state = 0;       // 0=live 1=deleted 2=dormant (record kept for lineage)
         u64 asid = 0;        // D2: address space id (gpu_memory.GetID()) at insert
     };
     // Bounded: at the cap, new inserts are skipped and counted (evidence, not lineage).
@@ -235,7 +235,13 @@ public:
     explicit TextureCache(Runtime&, Tegra::MaxwellDeviceMemoryManager&);
 
     /// Notify the cache that a new frame has been queued
-    // eglantine test 3 diagnostic accessors (evidence only)
+    // eglantine test 3 diagnostic accessors (evidence only).
+    // PRECONDITION: caller must hold texture_cache.mutex. These do plain
+    // unordered_map::find with no internal locking; the writers (JoinImages,
+    // CreateImageView, FindOrEmplaceImageView, InvalidateScale, DeleteImage,
+    // MakeDormant) mutate the same maps under that mutex (route audit at r15:
+    // all graphics/compute Configure call sites hold it). A concurrent find
+    // during a rehash would be a data race.
     u64 FrameTick() const {
         return frame_tick;
     }
@@ -255,9 +261,12 @@ public:
     }
 
     // D2: address space id recorded at insert (0 = untracked).
+    // Encoded for tags: returns MemoryManager id + 1, so 0 unambiguously means
+    // "untracked" (manager ids start at 0 - memory_manager.cpp fetch_add - so a
+    // raw id of 0 is the valid first address space).
     u64 DiagAsidOf(ImageId image_id) const {
         const auto it = diag_images_.find(image_id.index);
-        return it != diag_images_.end() ? it->second.asid : 0;
+        return it != diag_images_.end() ? it->second.asid + 1 : 0;
     }
     void TickFrame();
 

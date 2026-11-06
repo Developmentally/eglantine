@@ -509,8 +509,9 @@ void TextureCache<P>::TickFrame() {
             diag_snapshot_done = true;
             for (const auto& [slot, rec] : diag_images_) {
                 char diag_tag[40];
+                // asid tags print MemoryManager id + 1; 0 would mean untracked.
                 std::snprintf(diag_tag, sizeof(diag_tag), "gen%u as%llx", rec.generation,
-                              (unsigned long long)rec.asid);
+                              (unsigned long long)(rec.asid + 1));
                 Common::DiagTrace::Emit(Common::DiagTrace::Ev::IdentitySnap, frame_tick,
                                         rec.trace_obj, slot, rec.gpu_addr, rec.state, diag_tag);
             }
@@ -2507,12 +2508,14 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
         revived_id ? revived_id : slot_images.insert(runtime, new_info, gpu_addr, cpu_addr);
     Image& new_image = slot_images[new_image_id];
     u64 diag_trace_obj = 0;
-    // D2: which address space this lineage belongs to (evidence only).
-    const u64 diag_asid = channel_state->gpu_memory.GetID();
     // Diagnostic identity tracking only; skipped entirely when the master
     // switch is off, and fault-contained (map inserts can allocate/throw) so
     // an observer fault can never escape into image creation.
     Common::DiagTrace::Observe([&] {
+        // D2: which address space this lineage belongs to (evidence only).
+        // Computed inside the Enabled-gated block; tags print it + 1 so that
+        // 0 stays reserved for "untracked" (raw manager ids start at 0).
+        const u64 diag_asid = channel_state->gpu_memory.GetID();
         if (revived_id) {
         // Same slot object revived: keep its trace identity, bump the generation.
         if (auto dit = diag_images_.find(new_image_id.index); dit != diag_images_.end()) {
@@ -2533,7 +2536,7 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
             }
             char diag_revive_tag[48];
             std::snprintf(diag_revive_tag, sizeof(diag_revive_tag), "no-prior-record as%llx",
-                          (unsigned long long)diag_asid);
+                          (unsigned long long)(diag_asid + 1));
             Common::DiagTrace::Emit(Common::DiagTrace::Ev::ImageRevive, frame_tick,
                                     diag_trace_obj, new_image_id.index, gpu_addr, 0,
                                     diag_revive_tag);
@@ -2553,7 +2556,7 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
             diag_shape, sizeof(diag_shape), "fmt%u ty%u lv%u la%u f%x as%llx",
             static_cast<u32>(new_info.format), static_cast<u32>(new_info.type),
             new_info.resources.levels, new_info.resources.layers,
-            static_cast<u32>(new_image.flags), (unsigned long long)diag_asid);
+            static_cast<u32>(new_image.flags), (unsigned long long)(diag_asid + 1));
         if (diag_shape_len < 0 || static_cast<size_t>(diag_shape_len) >= sizeof(diag_shape)) {
             Common::DiagTrace::S().tag_truncated.fetch_add(1, std::memory_order_relaxed);
             std::memcpy(diag_shape + sizeof(diag_shape) - 4, "~TR", 4);
@@ -2596,7 +2599,7 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
             dit != diag_images_.end()) {
             char diag_evict_tag[48];
             std::snprintf(diag_evict_tag, sizeof(diag_evict_tag), "join-overlap-delete as%llx",
-                          (unsigned long long)dit->second.asid);
+                          (unsigned long long)(dit->second.asid + 1));
             Common::DiagTrace::Emit(Common::DiagTrace::Ev::RelatedEvict, frame_tick,
                                     dit->second.trace_obj, diag_trace_obj, overlap.gpu_addr, 0,
                                     diag_evict_tag);
@@ -2769,6 +2772,17 @@ void TextureCache<P>::MakeDormant(ImageId image_id) {
     }
     dormant_bytes += bytes;
     dormant_images[image.gpu_addr].push_back(DormantImage{image_id, frame_tick});
+    // D3: dormant is a distinct recorded state (was indistinguishable from
+    // "live" in IdentitySnap). Same unguarded-find shape as DeleteImage.
+    if (const auto dit = diag_images_.find(image_id.index); dit != diag_images_.end()) {
+        char diag_dorm_tag[24];
+        std::snprintf(diag_dorm_tag, sizeof(diag_dorm_tag), "as%llx",
+                      (unsigned long long)(dit->second.asid + 1));
+        Common::DiagTrace::Emit(Common::DiagTrace::Ev::ImageDormant, frame_tick,
+                                dit->second.trace_obj, image_id.index, dit->second.gpu_addr,
+                                dit->second.created_frame, diag_dorm_tag);
+        dit->second.state = 2;
+    }
 }
 
 template <class P>
@@ -3654,7 +3668,7 @@ void TextureCache<P>::DeleteImage(ImageId image_id, bool immediate_delete) {
         // the image may already be moved-from (sentenced).
         char diag_erase_tag[24];
         std::snprintf(diag_erase_tag, sizeof(diag_erase_tag), "as%llx",
-                      (unsigned long long)dit->second.asid);
+                      (unsigned long long)(dit->second.asid + 1));
         Common::DiagTrace::Emit(Common::DiagTrace::Ev::ImageErase, frame_tick,
                                 dit->second.trace_obj, image_id.index, dit->second.gpu_addr,
                                 dit->second.created_frame, diag_erase_tag);
