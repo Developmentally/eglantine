@@ -54,12 +54,15 @@ hash_of() { # path -> validated 64-hex digest on stdout, or die
 # Explicit seed action: atomically byte-copy the given working ini over the
 # kit's diagnostic ini (temp file + rename, so a symlinked or busy dest is
 # replaced, never written through, and a failed seed never truncates it) and
-# record a receipt. The receipt marker is REMOVED first (checked; a marker
-# that cannot be removed is chmod 000 so the launch gate still refuses) and
-# published only after the copy, the status-checked hash match, and the
-# sessions-log receipt line all succeed - atomically (temp + rename, then
-# verified), so a failed or partial write never leaves a marker. No path
-# guessing, no equality heuristics.
+# record a receipt. The receipt marker is REMOVED first (checked; if the
+# filesystem refuses the removal the seed dies loudly, changes NO permissions
+# - a symlinked or hardlinked marker must never cause a chmod of some other
+# inode - and the surviving last-good marker keeps the launch usable with the
+# previously seeded settings, which is the documented exception) and published
+# only after the copy, the status-checked hash match, and the sessions-log
+# receipt line all succeed - atomically (temp + rename, then verified), so a
+# failed or partial write never leaves a NEW marker. No path guessing, no
+# equality heuristics.
 # Seeding from the kit's own packaged default is allowed and recorded as
 # such (a deliberate choice).
 if [ "${1:-}" = "--seed-from" ]; then
@@ -89,8 +92,11 @@ if [ "${1:-}" = "--seed-from" ]; then
     # Fail-closed receipt: every step must succeed, the hashes must MATCH, the
     # evidence line must land in the sessions log BEFORE the marker exists, and
     # the marker must be published ATOMICALLY (temp + rename, verified after).
-    # Any failure dies nonzero with no valid marker, so a broken seed can
-    # never permit a launch.
+    # Any failure dies nonzero and publishes NO new marker; the old marker was
+    # already removed above, so no failed seed step can leave a
+    # launch-authorizing receipt. (The one exception: if removing the old
+    # marker itself failed, the run already died there - see the clearing
+    # check - and the last-good marker survives by design.)
     src_hash="$(hash_of "$src")" || exit 1
     dst_hash="$(hash_of "$EGLANTINE_SETTINGS")" || exit 1
     [ "$src_hash" = "$dst_hash" ] || \
