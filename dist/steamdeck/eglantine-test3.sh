@@ -34,6 +34,23 @@ export EGLANTINE_SETTINGS="$here/eglantine-test3.ini"
 [ -f "$EGLANTINE_SETTINGS" ] || die "settings file $EGLANTINE_SETTINGS is missing; it comes with this kit"
 receipt="$here/eglantine-test3.seeded"
 
+# Hash WITHOUT a pipeline: sha256sum's own exit status is checked (a
+# `| cut` pipeline would mask a nonzero exit behind cut's status), and the
+# digest must BE a 64-char lowercase-hex string - a plausible-looking but
+# invalid digest is rejected.
+hash_of() { # path -> validated 64-hex digest on stdout, or die
+    local out h
+    if ! out="$(sha256sum -- "$1")"; then
+        die "could not hash '$1' (sha256sum exited nonzero)"
+    fi
+    h="${out%% *}"
+    case "$h" in
+        ""|*[!0-9a-f]*) die "sha256sum output for '$1' is not a 64-char lowercase-hex digest ('$h')" ;;
+    esac
+    [ "${#h}" -eq 64 ] || die "sha256sum output for '$1' is not a 64-char lowercase-hex digest ('$h')"
+    printf '%s' "$h"
+}
+
 # Explicit seed action: atomically byte-copy the given working ini over the
 # kit's diagnostic ini (temp file + rename, so a symlinked or busy dest is
 # replaced, never written through, and a failed seed never truncates it) and
@@ -51,24 +68,18 @@ if [ "${1:-}" = "--seed-from" ]; then
     [ -f "$src" ] || die "seed source $src does not exist or is not a file"
     [ "$(realpath -m -- "$src")" != "$(realpath -m -- "$EGLANTINE_SETTINGS")" ] || die "seed source IS this kit's eglantine-test3.ini itself - a self-copy proves nothing. Point --seed-from at your WORKING build's eglantine-deck.ini"
     tmp="$here/.eglantine-test3.ini.tmp.$$"
-    # Clear any previous marker FIRST, and CHECK the clearing: a stale marker
-    # must never survive a failed reseed. If the file cannot be removed (e.g.
-    # the kit directory is unwritable), neutralize it (chmod 000, possible
-    # without directory write permission) so the launch gate's readability
-    # check still refuses, and die loudly either way.
+    # Clear any previous marker FIRST, and CHECK the clearing. rm only ever
+    # unlinks the marker path itself - this script NEVER changes permissions
+    # of anything at that path, because a symlink or hardlink there would
+    # make chmod hit an unrelated inode (an executed r34 review finding).
+    # If removal is refused (e.g. unwritable kit directory), die loudly:
+    # the surviving marker is exactly the last good seed's marker and the
+    # config is untouched, so a launch would still match the recorded
+    # receipt, but the user MUST see the failure and remove it manually.
     if [ -e "$receipt" ] || [ -L "$receipt" ]; then
         rm -f -- "$receipt" 2>/dev/null
         if [ -e "$receipt" ] || [ -L "$receipt" ]; then
-            if [ -f "$receipt" ]; then
-                if chmod 000 "$receipt" 2>/dev/null; then
-                    note="it was chmod 000, so the launch gate's readability check still refuses"
-                else
-                    note="it could not be neutralized - REMOVE IT MANUALLY before launching"
-                fi
-            else
-                note="it is not a regular file, so the launch gate already refuses it"
-            fi
-            die "could not clear the previous seed marker '$receipt' - seed aborted before copying; $note"
+            die "could not remove the previous seed marker '$receipt' - seed aborted before copying; no permissions were changed; the old marker is still the last good seed's, but remove it yourself and seed again"
         fi
     fi
     if ! cp -- "$src" "$tmp" || ! mv -f -- "$tmp" "$EGLANTINE_SETTINGS"; then
@@ -80,22 +91,6 @@ if [ "${1:-}" = "--seed-from" ]; then
     # the marker must be published ATOMICALLY (temp + rename, verified after).
     # Any failure dies nonzero with no valid marker, so a broken seed can
     # never permit a launch.
-    # Hash WITHOUT a pipeline: sha256sum's own exit status is checked (a
-    # `| cut` pipeline would mask a nonzero exit behind cut's status), and the
-    # digest must BE a 64-char lowercase-hex string - a plausible-looking but
-    # invalid digest is rejected.
-    hash_of() { # path -> validated 64-hex digest on stdout, or die
-        local out h
-        if ! out="$(sha256sum -- "$1")"; then
-            die "could not hash '$1' (sha256sum exited nonzero) - no marker written; seed again before running"
-        fi
-        h="${out%% *}"
-        case "$h" in
-            ""|*[!0-9a-f]*) die "sha256sum output for '$1' is not a 64-char lowercase-hex digest ('$h') - no marker written; seed again" ;;
-        esac
-        [ "${#h}" -eq 64 ] || die "sha256sum output for '$1' is not a 64-char lowercase-hex digest ('$h') - no marker written; seed again"
-        printf '%s' "$h"
-    }
     src_hash="$(hash_of "$src")" || exit 1
     dst_hash="$(hash_of "$EGLANTINE_SETTINGS")" || exit 1
     [ "$src_hash" = "$dst_hash" ] || \
@@ -125,12 +120,21 @@ if [ "${1:-}" = "--seed-from" ]; then
     exit 0
 fi
 
-# Fail-closed: refuse to run until an explicit seed receipt marker exists as
-# a READABLE, NON-EMPTY regular file with the exact receipt shape. An empty,
-# partial, unreadable (neutralized), or malformed marker never permits a
-# launch.
+# Fail-closed launch gate. The marker must be:
+#   (a) a READABLE, NON-EMPTY, SINGLY-LINKED regular file (never a symlink or
+#       a hardlink to another name - an aliased marker is refused, never
+#       modified) with the exact receipt shape - empty, partial, unreadable,
+#       or malformed markers refuse;
+#   (b) IDENTICAL to the latest seed receipt line in the sessions log - a
+#       hand-written marker without its recorded evidence does not count;
+#   (c) consistent with the INSTALLED CONFIG: the ini must either still be
+#       the freshly seeded bytes (first launch after seeding) or match the
+#       recorded end-state of the last completed session (the build rewrites
+#       its own ini at startup, so a diff after a run is the documented
+#       startup normalization). Anything else means the config was changed
+#       outside the recorded flow: refuse and ask for a re-seed.
 marker_ok=0
-if [ -f "$receipt" ] && [ -r "$receipt" ] && [ -s "$receipt" ]; then
+if [ -f "$receipt" ] && [ ! -L "$receipt" ] && [ -r "$receipt" ] && [ -s "$receipt" ] && [ "$(stat -c %h "$receipt")" -eq 1 ]; then
     if grep -qE "^eglantine-test3: seeded settings from '.+' src-sha256=[0-9a-f]{64} dst-sha256=[0-9a-f]{64}$" "$receipt" 2>/dev/null; then
         marker_ok=1
     fi
@@ -139,6 +143,30 @@ if [ "$marker_ok" != 1 ]; then
     clue=""
     [ -z "$inherited_settings" ] || clue=" (inherited EGLANTINE_SETTINGS=$inherited_settings is recorded above as a possible source clue - verify it is your working ini before using it)"
     die "settings not seeded yet (no valid seed receipt marker). Run: ./eglantine-test3.sh --seed-from <path to your working eglantine-deck.ini>$clue (see README-test3.txt)"
+fi
+marker_line="$(cat -- "$receipt")"
+last_seed="$(grep -h '^eglantine-test3: seeded settings from ' "$sessions" 2>/dev/null | tail -1)"
+if [ -z "$last_seed" ] || [ "$marker_line" != "$last_seed" ]; then
+    die "the seed marker does not match the latest seed receipt in '$sessions' - the marker or the log was changed outside the recorded flow. Seed again: ./eglantine-test3.sh --seed-from <path to your working eglantine-deck.ini>"
+fi
+ini_now="$(hash_of "$EGLANTINE_SETTINGS")" || exit 1
+dst_hash="${marker_line##* dst-sha256=}"
+config_ok=0
+if [ "$ini_now" = "$dst_hash" ]; then
+    config_ok=1
+else
+    seed_ln="$(grep -nF "$marker_line" "$sessions" | tail -1 | cut -d: -f1)"
+    end_line="$(grep -n ' session ended rc=' "$sessions" | tail -1)"
+    end_ln="${end_line%%:*}"
+    after_hash="${end_line##* after=}"
+    case "$end_ln" in ''|*[!0-9]*) end_ln=0 ;; esac
+    case "$seed_ln" in ''|*[!0-9]*) seed_ln=0 ;; esac
+    if [ "$end_ln" -gt "$seed_ln" ] && [ -n "$after_hash" ] && [ "$ini_now" = "$after_hash" ]; then
+        config_ok=1
+    fi
+fi
+if [ "$config_ok" != 1 ]; then
+    die "eglantine-test3.ini matches neither the seeded bytes nor the recorded end-state of the last session - the config was changed outside the recorded flow. Seed again: ./eglantine-test3.sh --seed-from <path to your working eglantine-deck.ini>"
 fi
 # Run-time guard: a symlinked OR hardlinked settings file would make the
 # build's startup rewrite write through to whatever shares the inode

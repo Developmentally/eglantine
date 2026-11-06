@@ -26,9 +26,29 @@
 #                            stdout is the receipt temp (editor's executed r33 attack:
 #                            a regular partial marker survived) -> rc!=0, NO marker, no tmp litter
 #  13 cleanup failure:       good seed, kit dir chmod 555, reseed -> rc!=0 naming the
-#                            clearing failure, stale marker chmod 000, launch still refuses
+#                            removal failure, NO permissions changed anywhere; the
+#                            surviving marker still matches the recorded receipt and the
+#                            untouched config, so launch proceeds with the last good
+#                            seed's settings (documented behavior, loudly failed seed)
 #  14 garbage markers:       empty file / 'partial' / valid-shape-wrong-length marker,
 #                            no seed -> launch refuses each
+#  15 symlink side effect:   receipt is a symlink to an unrelated 0640 file, kit dir
+#                            555 (editor's executed r34 finding: r34 chmod 000 the
+#                            TARGET) -> rc!=0, target mode/content UNCHANGED, launch
+#                            refuses the symlinked marker
+#  16 hardlink side effect:  receipt is a hardlink to an unrelated 0640 file, dir 555
+#                            -> rc!=0, target mode UNCHANGED, launch refuses the
+#                            multi-linked marker
+#  17 hand-written marker:   valid-shape line with fabricated 64-hex digests and no
+#                            matching sessions receipt -> launch refuses
+#  18 fabricated receipt:    after a real seed, marker replaced by a valid-shape line
+#                            with unequal 64-hex digests -> launch refuses
+#  19 config tamper:         after a real seed, ini modified outside the recorded flow
+#                            -> launch refuses (neither seeded bytes nor recorded
+#                            end-state)
+#  20 legit continuation:    dummy AppImage rewrites the ini like the real build's
+#                            startup normalization; launch 1 and launch 2 BOTH pass the
+#                            gate (recorded end-state branch) - guards over-refusal
 set -u
 REPO=${REPO:-/tmp/wt-test3}
 KIT_SRC="$REPO/dist/steamdeck"
@@ -141,7 +161,7 @@ mkdir "$D/eglantine-test3.seeded"
 out=$("$D/eglantine-test3.sh" --seed-from "$SRCINI" 2>&1); rc=$?
 [ "$rc" = 0 ] && rc_note=0 || rc_note=nonzero
 expect "seed rc nonzero" "$rc_note" "nonzero"
-expect "message names clearing failure" "$(echo "$out" | grep -c 'could not clear the previous seed marker')" "1"
+expect "message names removal failure" "$(echo "$out" | grep -c 'could not remove the previous seed marker')" "1"
 expect "sessions did NOT get the line" "$(grep -c 'seeded settings from' "$D/eglantine-test3-sessions.log" 2>/dev/null || echo 0)" "0"
 out=$("$D/eglantine-test3.sh" 2>&1); rc=$?
 expect "launch still refuses (dir is not a marker file)" "$rc" "1"
@@ -188,7 +208,7 @@ expect "launch refuses" "$rc" "1"
 expect "refusal names the invalid marker" "$(echo "$out" | grep -c 'no valid seed receipt marker')" "1"
 expect "no capture started" "$(echo "$out" | grep -c 'diagnostic capture')" "0"
 
-note "CASE 13 cleanup failure (kit dir unwritable during reseed)"
+note "CASE 13 cleanup failure (kit dir unwritable during reseed; no chmod anywhere)"
 D="$WORK/c13"; mk_kit "$D"
 "$D/eglantine-test3.sh" --seed-from "$SRCINI" >/dev/null 2>&1
 expect "initial seed marker" "$([ -f "$D/eglantine-test3.seeded" ] && echo yes || echo no)" "yes"
@@ -196,11 +216,16 @@ chmod 555 "$D"
 out=$("$D/eglantine-test3.sh" --seed-from "$SRCINI" 2>&1); rc=$?
 [ "$rc" = 0 ] && rc_note=0 || rc_note=nonzero
 expect "reseed rc nonzero" "$rc_note" "nonzero"
-expect "message names clearing failure" "$(echo "$out" | grep -c 'could not clear the previous seed marker')" "1"
-expect "stale marker neutralized (chmod 000)" "$(stat -c %a "$D/eglantine-test3.seeded")" "0"
+expect "message names removal failure" "$(echo "$out" | grep -c 'could not remove the previous seed marker')" "1"
+expect "message states no permissions changed" "$(echo "$out" | grep -c 'no permissions were changed')" "1"
+expect "stale marker mode UNCHANGED (644)" "$(stat -c %a "$D/eglantine-test3.seeded")" "644"
+# documented behavior: the surviving marker still matches the recorded receipt
+# and the untouched config, so launch proceeds with the last good seed's
+# settings (as if the failed re-seed was never attempted) - the failure was
+# loud (nonzero exit + message), nothing was silently hidden
 out=$("$D/eglantine-test3.sh" 2>&1); rc=$?
-expect "launch refuses (unreadable marker)" "$rc" "1"
-expect "refusal message" "$(echo "$out" | grep -c 'no valid seed receipt marker')" "1"
+expect "launch proceeds with last-good settings (rc 1 from dummy AppImage)" "$rc" "1"
+expect "capture started with recorded settings" "$(echo "$out" | grep -c 'diagnostic capture')" "1"
 chmod 755 "$D"
 
 note "CASE 14 garbage markers never permit launch"
@@ -217,9 +242,81 @@ for shape in empty partial wronghash; do
   expect "no capture started ($shape)" "$(echo "$out" | grep -c 'diagnostic capture')" "0"
 done
 
+note "CASE 15 symlink side effect (editor's executed r34 finding)"
+D="$WORK/c15"; mk_kit "$D"
+TARGET="$WORK/unrelated-target.ini"; printf 'unrelated\n' > "$TARGET"; chmod 640 "$TARGET"
+ln -s "$TARGET" "$D/eglantine-test3.seeded"
+chmod 555 "$D"
+out=$("$D/eglantine-test3.sh" --seed-from "$SRCINI" 2>&1); rc=$?
+[ "$rc" = 0 ] && rc_note=0 || rc_note=nonzero
+expect "seed rc nonzero" "$rc_note" "nonzero"
+expect "target mode UNCHANGED (640)" "$(stat -c %a "$TARGET")" "640"
+expect "target content unchanged" "$(cat "$TARGET")" "unrelated"
+out=$("$D/eglantine-test3.sh" 2>&1); rc=$?
+expect "launch refuses symlinked marker" "$rc" "1"
+expect "refusal names invalid marker" "$(echo "$out" | grep -c 'no valid seed receipt marker')" "1"
+expect "no capture started" "$(echo "$out" | grep -c 'diagnostic capture')" "0"
+chmod 755 "$D"
+
+note "CASE 16 hardlink side effect (editor's executed r34 finding, hardlink variant)"
+D="$WORK/c16"; mk_kit "$D"
+TARGET="$WORK/unrelated-target2.ini"; printf 'unrelated2\n' > "$TARGET"; chmod 640 "$TARGET"
+ln "$TARGET" "$D/eglantine-test3.seeded"
+chmod 555 "$D"
+out=$("$D/eglantine-test3.sh" --seed-from "$SRCINI" 2>&1); rc=$?
+[ "$rc" = 0 ] && rc_note=0 || rc_note=nonzero
+expect "seed rc nonzero" "$rc_note" "nonzero"
+expect "target mode UNCHANGED (640)" "$(stat -c %a "$TARGET")" "640"
+out=$("$D/eglantine-test3.sh" 2>&1); rc=$?
+expect "launch refuses multi-linked marker" "$rc" "1"
+expect "no capture started" "$(echo "$out" | grep -c 'diagnostic capture')" "0"
+chmod 755 "$D"
+
+note "CASE 17 hand-written valid-shape marker, no recorded receipt"
+D="$WORK/c17"; mk_kit "$D"
+printf "eglantine-test3: seeded settings from '/tmp/fake' src-sha256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa dst-sha256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n" > "$D/eglantine-test3.seeded"
+out=$("$D/eglantine-test3.sh" 2>&1); rc=$?
+expect "launch refuses (rc 1)" "$rc" "1"
+expect "message names marker/log mismatch" "$(echo "$out" | grep -c 'does not match the latest seed receipt')" "1"
+expect "no capture started" "$(echo "$out" | grep -c 'diagnostic capture')" "0"
+
+note "CASE 18 fabricated receipt: valid shape, unequal 64-hex digests, after a real seed"
+D="$WORK/c18"; mk_kit "$D"
+"$D/eglantine-test3.sh" --seed-from "$SRCINI" >/dev/null 2>&1
+printf "eglantine-test3: seeded settings from '/tmp/fake' src-sha256=cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc dst-sha256=cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\n" > "$D/eglantine-test3.seeded"
+out=$("$D/eglantine-test3.sh" 2>&1); rc=$?
+expect "launch refuses (rc 1)" "$rc" "1"
+expect "message names marker/log mismatch" "$(echo "$out" | grep -c 'does not match the latest seed receipt')" "1"
+expect "no capture started" "$(echo "$out" | grep -c 'diagnostic capture')" "0"
+
+note "CASE 19 config changed outside the recorded flow"
+D="$WORK/c19"; mk_kit "$D"
+"$D/eglantine-test3.sh" --seed-from "$SRCINI" >/dev/null 2>&1
+printf '# external edit\n' >> "$D/eglantine-test3.ini"
+out=$("$D/eglantine-test3.sh" 2>&1); rc=$?
+expect "launch refuses (rc 1)" "$rc" "1"
+expect "message names config mismatch" "$(echo "$out" | grep -c 'matches neither the seeded bytes nor the recorded end-state')" "1"
+expect "no capture started" "$(echo "$out" | grep -c 'diagnostic capture')" "0"
+
+note "CASE 20 legitimate continuation (build rewrites its own ini at startup)"
+D="$WORK/c20"; mk_kit "$D"
+# deck.sh requires <game>/exefs/main to exec the AppImage; dummy game folder:
+mkdir -p "$D/MKW/exefs"; : > "$D/MKW/exefs/main"
+printf '#!/bin/bash\necho "# startup-normalized" >> "%s/eglantine-test3.ini"\nexit 1\n' "$D" > "$D/eglantine test 3.AppImage"
+chmod +x "$D/eglantine test 3.AppImage"
+"$D/eglantine-test3.sh" --seed-from "$SRCINI" >/dev/null 2>&1
+out=$("$D/eglantine-test3.sh" "$D/MKW" 2>&1); rc=$?
+expect "launch 1 passes gate (rc 1 from dummy)" "$rc" "1"
+expect "launch 1 capture started" "$(echo "$out" | grep -c 'diagnostic capture')" "1"
+expect "ini was rewritten by the run" "$(grep -c 'startup-normalized' "$D/eglantine-test3.ini")" "1"
+expect "session end recorded after-hash" "$(grep -c 'session ended rc=1' "$D/eglantine-test3-sessions.log")" "1"
+out=$("$D/eglantine-test3.sh" "$D/MKW" 2>&1); rc=$?
+expect "launch 2 passes gate via recorded end-state (rc 1 from dummy)" "$rc" "1"
+expect "launch 2 capture started" "$(echo "$out" | grep -c 'diagnostic capture')" "1"
+
 echo ""
 if [ "$fails" = 0 ]; then
-  echo "SEED FAILURE-INJECTION: all expectations met (14 cases)"
+  echo "SEED FAILURE-INJECTION: all expectations met (20 cases)"
 else
   echo "SEED FAILURE-INJECTION: $fails expectation(s) FAILED"
   exit 1
