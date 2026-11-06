@@ -25,8 +25,9 @@ sessions="$here/eglantine-test3-sessions.log"
 # NEVER inherit EGLANTINE_SETTINGS: it is the standard launcher's variable and
 # could point at the WORKING ini, which the build rewrites at startup. The
 # diagnostic build always uses this kit's own eglantine-test3.ini.
-if [ -n "${EGLANTINE_SETTINGS:-}" ]; then
-    echo "eglantine-test3: ignoring inherited EGLANTINE_SETTINGS=$EGLANTINE_SETTINGS (it could be your working ini); using this kit's eglantine-test3.ini" | tee -a "$sessions" >&2
+inherited_settings="${EGLANTINE_SETTINGS:-}"
+if [ -n "$inherited_settings" ]; then
+    echo "eglantine-test3: ignoring inherited EGLANTINE_SETTINGS=$inherited_settings (it could be your working ini); using this kit's eglantine-test3.ini. Recorded as a possible seed-source clue, never used as a destination" | tee -a "$sessions" >&2
     unset EGLANTINE_SETTINGS
 fi
 export EGLANTINE_SETTINGS="$here/eglantine-test3.ini"
@@ -45,6 +46,7 @@ if [ "${1:-}" = "--seed-from" ]; then
     [ $# -eq 2 ] || die "--seed-from takes exactly one argument: the path to your working eglantine-deck.ini"
     src="$2"
     [ -f "$src" ] || die "seed source $src does not exist or is not a file"
+    [ "$(realpath -m -- "$src")" != "$(realpath -m -- "$EGLANTINE_SETTINGS")" ] || die "seed source IS this kit's eglantine-test3.ini itself - a self-copy proves nothing. Point --seed-from at your WORKING build's eglantine-deck.ini"
     tmp="$here/.eglantine-test3.ini.tmp.$$"
     rm -f "$receipt"
     if ! cp -- "$src" "$tmp" || ! mv -f -- "$tmp" "$EGLANTINE_SETTINGS"; then
@@ -59,7 +61,11 @@ if [ "${1:-}" = "--seed-from" ]; then
 fi
 
 # Fail-closed: refuse to run until an explicit seed receipt marker exists.
-[ -f "$receipt" ] || die "settings not seeded yet. Run: ./eglantine-test3.sh --seed-from <path to your working eglantine-deck.ini> (see README-test3.txt)"
+if [ ! -f "$receipt" ]; then
+    clue=""
+    [ -z "$inherited_settings" ] || clue=" (inherited EGLANTINE_SETTINGS=$inherited_settings is recorded above as a possible source clue - verify it is your working ini before using it)"
+    die "settings not seeded yet. Run: ./eglantine-test3.sh --seed-from <path to your working eglantine-deck.ini>$clue (see README-test3.txt)"
+fi
 # Run-time guard: a symlinked OR hardlinked settings file would make the
 # build's startup rewrite write through to whatever shares the inode
 # (possibly the working ini). Refuse; reseed to fix. (The seed's temp+rename
@@ -114,15 +120,25 @@ export EDEN_NX2_TRACE=1
 appimage="$here/eglantine test 3.AppImage"
 [ -f "$appimage" ] || die "'eglantine test 3.AppImage' is missing from $here"
 
+sid="$(date +%Y%m%d-%H%M%S).$$"
 ini_hash_before="$(sha256sum "$EGLANTINE_SETTINGS" | cut -d' ' -f1)"
 effective_env="$(env | grep '^EDEN_NX2_' | sort | tr '\n' ' ')"
-echo "eglantine-test3: diagnostic capture (evidence only, not a fix); settings=$(basename "$EGLANTINE_SETTINGS") sha256-before=$ini_hash_before env: $effective_env" | tee -a "$sessions" >&2
+echo "eglantine-test3: [$sid] diagnostic capture (evidence only, not a fix); settings=$(basename "$EGLANTINE_SETTINGS") sha256-before=$ini_hash_before env: $effective_env" | tee -a "$sessions" >&2
 
 # deck.sh applies its own defaults AFTER the wrapper's record above (e.g.
 # EDEN_NX2_AUTO_STUB=1, --frames-ahead -> EDEN_NX2_FRAMES_AHEAD=a) and echoes
-# the final effective env to stderr - capture that stderr durably too.
-"$here/eglantine-deck.sh" --appimage "$appimage" "$@" 2> >(tee -a "$sessions" >&2)
+# the final effective env to stderr. Capture ALL deck/app stderr to a temp
+# file and append it to the sessions log AFTER the run: synchronous (no lost
+# tail, no ordering ambiguity), bounded to the last 128 KiB.
+deck_err="$here/.eglantine-test3-stderr.$sid"
+"$here/eglantine-deck.sh" --appimage "$appimage" "$@" 2> "$deck_err"
 rc=$?
 ini_hash_after="$(sha256sum "$EGLANTINE_SETTINGS" | cut -d' ' -f1)"
-echo "eglantine-test3: session ended rc=$rc settings-sha256 before=$ini_hash_before after=$ini_hash_after" | tee -a "$sessions" >&2
+{
+    echo "eglantine-test3: [$sid] deck/app stderr follows (bounded to the last 131072 bytes):"
+    tail -c 131072 "$deck_err"
+    echo "eglantine-test3: [$sid] end of deck/app stderr"
+} | tee -a "$sessions" >&2
+rm -f "$deck_err"
+echo "eglantine-test3: [$sid] session ended rc=$rc settings-sha256 before=$ini_hash_before after=$ini_hash_after" | tee -a "$sessions" >&2
 exit $rc

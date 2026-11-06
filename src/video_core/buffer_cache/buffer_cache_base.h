@@ -576,7 +576,7 @@ private:
         }
     }
 
-    [[nodiscard]] u32 WriteEpoch(DAddr device_addr, u64 size) const {
+    [[nodiscard]] u32 WriteEpoch(DAddr device_addr, u64 size) const noexcept {
         const DAddr first = device_addr >> Core::DEVICE_PAGEBITS;
         const DAddr last = (device_addr + size - 1) >> Core::DEVICE_PAGEBITS;
         u32 epoch = 0;

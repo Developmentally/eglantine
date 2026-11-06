@@ -23,7 +23,9 @@ STEP 1 - seed the diagnostic settings from your ACTUAL working settings:
   The packaged eglantine-test3.ini is only the fork's default. Your working
   build rewrites its own ini at every launch, so yours may differ. Seed the
   diagnostic settings from your working build BEFORE the first launch:
-    ./eglantine-test3.sh --seed-from "<working build folder>/eglantine-deck.ini"
+    ./eglantine-test3.sh --seed-from "/home/deck/Downloads/eglantine-steamdeck-dev-tc-memory-ports-d551c07/eglantine-deck.ini"
+  (That is the settings file your working d551 launcher uses, per your
+  working shortcut: Start In /home/deck/Downloads/eglantine-steamdeck-dev-tc-memory-ports-d551c07.)
   This atomically byte-copies the file (temp + rename; a symlinked or busy
   target is replaced, never written through, and a failed seed leaves the
   old file untouched) and records a receipt (source path, both hashes) in
@@ -35,13 +37,17 @@ STEP 1 - seed the diagnostic settings from your ACTUAL working settings:
 
 STEP 2 - launch (Desktop Mode first):
   1. Make the AppImage executable: Properties -> Permissions -> "Is executable".
-  2. In this folder, run the test 3 launcher with your usual game folder
-     (the folder that holds the game's exefs/ and romfs/):
-       ./eglantine-test3.sh "your usual game folder"
-  3. Game Mode: add eglantine-test3.sh as a non-Steam game with your game
-     folder as the launch option. The exact Steam argument line is NOT yet
-     verified, so dry-run this in Desktop Mode first; if it misbehaves, send
-     the session line from eglantine-test3-sessions.log.
+  2. In this folder, run the test 3 launcher the same way your working
+     shortcut launches the game (same game folder, same --frames-ahead):
+       ./eglantine-test3.sh "/home/deck/Downloads/base" --frames-ahead
+     --frames-ahead is part of your working launch; keep it identical so the
+     capture matches what you actually play.
+  3. Game Mode: same shape as your working shortcut - Target "/usr/bin/bash",
+     Start In = this folder, Launch Options:
+       "<this folder>/eglantine-test3.sh" "/home/deck/Downloads/base" --frames-ahead
+     The exact Steam argument line is NOT yet verified, so dry-run it in
+     Desktop Mode first; if it misbehaves, send the session lines from
+     eglantine-test3-sessions.log.
   4. The capture turns itself on (EDEN_NX2_TRACE=1). Trace lines (T3TRACE) go
      to the usual log: ~/.local/share/eden/log/eden_log.txt
   5. Send the log before relaunching - a new launch rotates it (one previous
@@ -66,6 +72,14 @@ Limits you will hit on purpose:
   - The session log carries two env records per run: the launcher's own
     pre-launch line, then the standard launcher's "eglantine-deck:" line with
     the FINAL effective env (it applies its own defaults, e.g. AUTO_STUB).
+    All deck/app stderr is captured and appended after the run (bounded to
+    the last 128 KiB, replayed to the screen too); every line group carries
+    a session id like [20261106-003000.1234].
+  - eglantine-test3.ini must stay a real, singly-linked file: the launcher
+    REFUSES to run if it is a symlink or has extra hard links (either would
+    make the build's startup rewrite write through to the file it aliases).
+    Seeding from the diagnostic ini itself is also refused (a self-copy
+    proves nothing).
   - A literal -- argument and a user --appimage are REFUSED (the launcher
     owns the binary choice and the argument shape).
   - The capture window defaults to everything. Instinct may ask you to set

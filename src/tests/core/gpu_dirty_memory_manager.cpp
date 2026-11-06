@@ -41,6 +41,19 @@ constexpr PAddr kPageB = 0x0000'0400'0800; // next manager page
 
 } // namespace
 
+TEST_CASE("DiagTrace names every event class", "[diagtrace]") {
+    // An enum insert without a matching kClsNames insert silently mislabels
+    // every later class; the static_assert keeps the count honest and this
+    // keeps every entry named and unique.
+    for (u32 i = 0; i < static_cast<u32>(Common::DiagTrace::Ev::Count); ++i) {
+        REQUIRE(std::string(Common::DiagTrace::ClsName(i)) != "Unknown");
+        for (u32 j = i + 1; j < static_cast<u32>(Common::DiagTrace::Ev::Count); ++j) {
+            REQUIRE(std::string(Common::DiagTrace::ClsName(i)) !=
+                    std::string(Common::DiagTrace::ClsName(j)));
+        }
+    }
+}
+
 TEST_CASE("GPUDirtyMemoryManager: second same-page write is delivered", "[gpu_dirty]") {
     Core::GPUDirtyMemoryManager manager;
     // First write to the page (in the live path this one also ran OnCPUWrite).

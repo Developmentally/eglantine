@@ -107,15 +107,6 @@ enum class Ev : u8 {
                      // callers), join-resize/join-shrink[-msaa] (direct runtime
                      // calls in the join), blit (TextureCache::BlitImage issue
                      // point). CopyImageMSAA outside the join is NOT covered
-    DrawBuf,         // a=draw_seq (0 = bind outside a draw scope) b=device_addr c=size
-                     // d=write epoch at bind time (same per-page summed epoch source as
-                     // BufEpoch's a) tag=kind: index / vertex<slot>. Vertex emits fire
-                     // when the binding is queued into the bind batch; every queued
-                     // binding is bound by the end of that call. BINDS ARE CACHED: a
-                     // draw with no DrawBuf line for a slot reuses the last bound
-                     // buffer - correlate with the BufEpoch stream for writes landing
-                     // after the bind. Coverage: index + vertex binds only (uniform,
-                     // storage and indirect-argument buffers are NOT covered)
     BufEpoch,        // a=write_epoch b=device_addr c=size
     HrwSeed,         // a=core b=page c=address d=size
     HrwSkip,         // a=core b=page c=address d=size (shortcut hit, OnCPUWrite not called)
@@ -156,10 +147,13 @@ enum class Ev : u8 {
                      //                for async-decode this is a guard only - cancelled
                      //                drops decodes of deleted images, so if it fires
                      //                the cancel path missed: new evidence, not routine
-                     //   -erased      image record state=deleted at completion. For
-                     //                unswizzle this is a PRE-EXISTING hazard (DeleteImage
-                     //                never touches unswizzle_queue) - observe it, do not
-                     //                read it as a new defect or as the user's cause
+                     //   -erased      the QUEUED object's own record state=deleted at
+                     //                completion (identity checked first). For unswizzle
+                     //                this documents a PRE-EXISTING hazard (DeleteImage
+                     //                never touches unswizzle_queue) - observe it, do
+                     //                not read it as a new defect or as the user's
+                     //                cause. For async-decode it is a guard like
+                     //                -superseded: firing means the cancel path missed
                      //   -missing     no diag record at completion
                      //   -unknown     a=0, nothing to re-check against
                      // The suffixes are observed only when a completion is reached; an
@@ -176,6 +170,15 @@ enum class Ev : u8 {
                      // there is expected, not missing evidence). Byte counts stay with
                      // the images_uploaded / uploaded_bytes aggregates; c is a layer
                      // count, never bytes
+    DrawBuf,         // a=draw_seq (0 = bind outside a draw scope) b=device_addr c=size
+                     // d=write epoch at bind time (same per-page summed epoch source as
+                     // BufEpoch's a) tag=kind: index / vertex<slot>. Vertex emits fire
+                     // when the binding is queued into the bind batch; every queued
+                     // binding is bound by the end of that call. BINDS ARE CACHED: a
+                     // draw with no DrawBuf line for a slot reuses the last bound
+                     // buffer - correlate with the BufEpoch stream for writes landing
+                     // after the bind. Coverage: index + vertex binds only (uniform,
+                     // storage and indirect-argument buffers are NOT covered)
     Count
 };
 
@@ -299,7 +302,7 @@ inline bool InWindow(u64 frame) {
     return frame >= s.from_frame && frame <= s.to_frame;
 }
 
-inline u64 CurrentFrame() {
+inline u64 CurrentFrame() noexcept {
     return S().current_frame.load(std::memory_order_relaxed);
 }
 
@@ -458,16 +461,21 @@ inline void EmitImpl(Ev cls, u64 frame, u64 a, u64 b, u64 c, u64 d, const char* 
     s.emitted[i].fetch_add(1, std::memory_order_relaxed);
 }
 
+// One name per Ev, in enum order; appending a class REQUIRES appending its
+// name here (the assert keeps the two in lockstep - a mid-enum insert without
+// a matching name insert silently mislabels every later class).
+inline constexpr std::array kClsNames{
+    "ImageCreate", "ImageErase",  "ImageRevive", "RelatedEvict", "ViewCreate",
+    "ViewCacheHit", "ViewErase",  "Draw",        "DrawSkip",     "DescFinal",
+    "DescRoute",   "RTBind",      "CopyDep",     "BufEpoch",     "HrwSeed",
+    "HrwSkip",     "HrwCollect",  "HrwBufAccept","HrwBufReject", "HrwGather",
+    "HrwDrain",    "HrwCacheInval","HrwUpload",  "Config",       "IdentitySnap",
+    "ImageDormant","ImageUpload", "DrawBuf",
+};
+static_assert(kClsNames.size() == static_cast<size_t>(Ev::Count),
+              "every Ev class must have exactly one ClsName entry, in order");
 inline const char* ClsName(u32 cls) {
-    static constexpr std::array names{
-        "ImageCreate", "ImageErase",  "ImageRevive", "RelatedEvict", "ViewCreate",
-        "ViewCacheHit", "ViewErase",  "Draw",        "DrawSkip",     "DescFinal",
-        "DescRoute",   "RTBind",      "CopyDep",     "BufEpoch",     "HrwSeed",
-        "HrwSkip",     "HrwCollect",  "HrwBufAccept","HrwBufReject", "HrwGather",
-        "HrwDrain",    "HrwCacheInval","HrwUpload",  "Config",       "IdentitySnap",
-        "ImageDormant",
-    };
-    return cls < names.size() ? names[cls] : "Unknown";
+    return cls < kClsNames.size() ? kClsNames[cls] : "Unknown";
 }
 
 inline std::string CounterSummary() {
