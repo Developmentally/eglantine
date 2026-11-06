@@ -404,12 +404,13 @@ inline void PushImageDescriptors(TextureCache& texture_cache,
                 // b always carries the ORIGINAL image's trace id; the final
                 // resource is identified by d (raw VkImageView) + the tag's
                 // final-kind char: k=kept original, n=null fallback, o=nx2 override.
-                char diag_tag[48];
+                char diag_tag[64];
                 const int diag_len = std::snprintf(
-                    diag_tag, sizeof(diag_tag), "s%u x%llx#%u ty%u g%llu f%c", diag_stage,
+                    diag_tag, sizeof(diag_tag), "s%u x%llx#%u ty%u g%llu f%c as%llx", diag_stage,
                     (unsigned long long)desc.cbuf_offset, index, static_cast<u32>(desc.type),
                     (unsigned long long)texture_cache.DiagViewGenOf(image_view_id),
-                    diag_null_fb ? 'n' : (diag_ovr ? 'o' : 'k'));
+                    diag_null_fb ? 'n' : (diag_ovr ? 'o' : 'k'),
+                    (unsigned long long)texture_cache.DiagAsidOf(image_view.image_id));
                 if (diag_len < 0 || static_cast<size_t>(diag_len) >= sizeof(diag_tag)) {
                     Common::DiagTrace::S().tag_truncated.fetch_add(1, std::memory_order_relaxed);
                     std::memcpy(diag_tag + sizeof(diag_tag) - 4, "~TR", 4);
@@ -447,13 +448,15 @@ inline void PushImageDescriptors(TextureCache& texture_cache,
                                    static_cast<u32>(VideoCommon::ImageFlagBits::ZeroFilled))) == 0) {
                     return;
                 }
-                char diag_tag[48];
+                char diag_tag[72];
                 const int diag_len = std::snprintf(
-                    diag_tag, sizeof(diag_tag), "s%u x%llx#%u ty%u g%llu storage%s", diag_stage,
-                    (unsigned long long)desc.cbuf_offset, index, static_cast<u32>(desc.type),
+                    diag_tag, sizeof(diag_tag), "s%u x%llx#%u ty%u g%llu storage%s as%llx",
+                    diag_stage, (unsigned long long)desc.cbuf_offset, index,
+                    static_cast<u32>(desc.type),
                     (unsigned long long)texture_cache.DiagViewGenOf(
                         VideoCommon::ImageViewId{(views - 1)->id}),
-                    desc.is_written ? " written" : "");
+                    desc.is_written ? " written" : "",
+                    (unsigned long long)texture_cache.DiagAsidOf(image_view.image_id));
                 if (diag_len < 0 || static_cast<size_t>(diag_len) >= sizeof(diag_tag)) {
                     Common::DiagTrace::S().tag_truncated.fetch_add(1, std::memory_order_relaxed);
                     std::memcpy(diag_tag + sizeof(diag_tag) - 4, "~TR", 4);

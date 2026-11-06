@@ -507,8 +507,9 @@ void TextureCache<P>::TickFrame() {
         Common::DiagTrace::Observe([&] {
             diag_snapshot_done = true;
             for (const auto& [slot, rec] : diag_images_) {
-                char diag_tag[16];
-                std::snprintf(diag_tag, sizeof(diag_tag), "gen%u", rec.generation);
+                char diag_tag[40];
+                std::snprintf(diag_tag, sizeof(diag_tag), "gen%u as%llx", rec.generation,
+                              (unsigned long long)rec.asid);
                 Common::DiagTrace::Emit(Common::DiagTrace::Ev::IdentitySnap, frame_tick,
                                         rec.trace_obj, slot, rec.gpu_addr, rec.state, diag_tag);
             }
@@ -2540,7 +2541,7 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
         std::snprintf(diag_shape, sizeof(diag_shape), "fmt%u ty%u lv%u la%u f%x as%llx",
                       static_cast<u32>(new_info.format), static_cast<u32>(new_info.type),
                       new_info.resources.levels, new_info.resources.layers,
-                      static_cast<u32>(new_info.flags), (unsigned long long)diag_asid);
+                      static_cast<u32>(new_image.flags), (unsigned long long)diag_asid);
         Common::DiagTrace::Emit(Common::DiagTrace::Ev::ImageCreate, frame_tick,
                                 diag_trace_obj, new_image_id.index, gpu_addr,
                                 new_image.guest_size_bytes, diag_shape);
@@ -2577,9 +2578,12 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
         UnregisterImage(overlap_id);
         if (const auto dit = diag_images_.find(overlap_id.index);
             dit != diag_images_.end()) {
+            char diag_evict_tag[48];
+            std::snprintf(diag_evict_tag, sizeof(diag_evict_tag), "join-overlap-delete as%llx",
+                          (unsigned long long)dit->second.asid);
             Common::DiagTrace::Emit(Common::DiagTrace::Ev::RelatedEvict, frame_tick,
                                     dit->second.trace_obj, diag_trace_obj, overlap.gpu_addr, 0,
-                                    "join-overlap-delete");
+                                    diag_evict_tag);
         }
         DeleteImage(overlap_id);
     }
@@ -3625,9 +3629,12 @@ void TextureCache<P>::DeleteImage(ImageId image_id, bool immediate_delete) {
     if (const auto dit = diag_images_.find(image_id.index); dit != diag_images_.end()) {
         // Emitted at the actual slot-free point; address taken from the record because
         // the image may already be moved-from (sentenced).
+        char diag_erase_tag[24];
+        std::snprintf(diag_erase_tag, sizeof(diag_erase_tag), "as%llx",
+                      (unsigned long long)dit->second.asid);
         Common::DiagTrace::Emit(Common::DiagTrace::Ev::ImageErase, frame_tick,
                                 dit->second.trace_obj, image_id.index, dit->second.gpu_addr,
-                                dit->second.created_frame);
+                                dit->second.created_frame, diag_erase_tag);
         dit->second.state = 1;
     }
     slot_images.erase(image_id);

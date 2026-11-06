@@ -252,6 +252,12 @@ public:
         const auto it = diag_images_.find(image_id.index);
         return it != diag_images_.end() ? it->second.trace_obj : 0;
     }
+
+    // D2: address space id recorded at insert (0 = untracked).
+    u64 DiagAsidOf(ImageId image_id) const {
+        const auto it = diag_images_.find(image_id.index);
+        return it != diag_images_.end() ? it->second.asid : 0;
+    }
     void TickFrame();
 
     /// Read back the images named by EDEN_NX2_IMAGE_DUMP to files

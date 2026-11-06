@@ -896,7 +896,12 @@ TEST_CASE("Criterion2 consumer: deferred second same-page write reaches the real
           "[gpu_dirty]") {
     RunConsumerCase(false, 0x0000'0000'0100'0000, 0x0000'0002'0000'0000,
                     [](ChainTestBuffer& buf, const std::vector<std::pair<PAddr, size_t>>& drains,
-                       unsigned, u64, u64, VideoCommon::BufferCache<ChainTestParams>&) {
+                       unsigned collect_calls, u64 staging_calls, u64,
+                       VideoCommon::BufferCache<ChainTestParams>&) {
+        // Exactly two collects (steps 2 and 4), two drains, and three real
+        // staged uploads (value1, value2, value3).
+        REQUIRE(collect_calls == 2);
+        REQUIRE(staging_calls == 3);
         // Exactly two drains: one per collected write (steps 2 and 4).
         REQUIRE(drains.size() == 2);
         // The second drain covers the written 64 bytes.
