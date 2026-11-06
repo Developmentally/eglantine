@@ -172,7 +172,7 @@ inline thread_local bool tl_selected_draw = false;
 
 // Begin a recorded draw/dispatch. Selected-draw budget is consumed ONLY for
 // draws starting inside the capture window.
-inline bool BeginDraw(u64 frame, u64& out_draw_seq) {
+inline bool BeginDrawImpl(u64 frame, u64& out_draw_seq) {
     ReadEnvOnce();
     State& s = S();
     if (!s.enabled.load(std::memory_order_relaxed)) {
@@ -201,7 +201,32 @@ inline void EndDraw() {
     tl_selected_draw = false;
 }
 
-inline void Emit(Ev cls, u64 frame, u64 a, u64 b, u64 c, u64 d, const char* tag = "") {
+inline bool BeginDraw(u64 frame, u64& out_draw_seq) noexcept {
+    try {
+        return BeginDrawImpl(frame, out_draw_seq);
+    } catch (...) {
+        out_draw_seq = 0;
+        tl_draw_seq = 0;
+        tl_selected_draw = false;
+        return false;
+    }
+}
+
+inline void EmitImpl(Ev cls, u64 frame, u64 a, u64 b, u64 c, u64 d, const char* tag);
+
+// Observer failure isolation: tracing must never change the behavior it
+// observes. Any exception inside an emit (ring/map/format allocation when
+// enabled) is contained and charged to the class's dropped counter - a throw
+// can never skip a gated Collect, a draw record, or a cache mark.
+inline void Emit(Ev cls, u64 frame, u64 a, u64 b, u64 c, u64 d, const char* tag = "") noexcept {
+    try {
+        EmitImpl(cls, frame, a, b, c, d, tag);
+    } catch (...) {
+        S().dropped[static_cast<size_t>(cls)].fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+inline void EmitImpl(Ev cls, u64 frame, u64 a, u64 b, u64 c, u64 d, const char* tag) {
     ReadEnvOnce();
     State& s = S();
     if (!s.enabled.load(std::memory_order_relaxed)) {
@@ -278,7 +303,7 @@ inline std::string CounterSummary() {
 // Formats and logs every buffered event under the ring mutex (the logger has
 // its own lock and never calls back into DiagTrace, so no lock cycle). A
 // summary line is printed only when this flush emitted at least one event.
-inline void Flush(u64 frame, const char* why) {
+inline void FlushImpl(u64 frame, const char* why) {
     ReadEnvOnce();
     State& s = S();
     if (!s.enabled.load(std::memory_order_relaxed)) {
@@ -331,6 +356,15 @@ inline void Flush(u64 frame, const char* why) {
 
 // Intended-cadence tick: publishes the capture clock and flushes when the
 // frame advanced past the cadence.
+// noexcept wrapper: a throwing flush (format/allocation when enabled) is
+// contained; buffered events stay in the ring for a later flush attempt.
+inline void Flush(u64 frame, const char* why) noexcept {
+    try {
+        FlushImpl(frame, why);
+    } catch (...) {
+    }
+}
+
 inline void TickFlush(u64 frame) {
     ReadEnvOnce();
     State& s = S();
