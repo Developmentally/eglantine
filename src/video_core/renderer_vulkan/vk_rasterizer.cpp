@@ -1069,6 +1069,11 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {
     }
     std::scoped_lock lock{buffer_cache.mutex, texture_cache.mutex};
     if (ResetIndirectRecordsOnCpu(is_indexed)) {
+        // F6: this early return consumed a draw_seq with no event; make the gap
+        // distinguishable from ring loss.
+        Common::DiagTrace::Emit(Common::DiagTrace::Ev::DrawSkip, texture_cache.FrameTick(),
+                                Common::DiagTrace::tl_draw_seq, 0, 0, 0,
+                                "indirect-records-reset");
         submitted = true;
         return;
     }

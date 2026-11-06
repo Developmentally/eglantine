@@ -957,9 +957,12 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
                       rescaling_data = rescaling.Data(), is_rescaling, update_rescaling,
                       uses_render_area = render_area.uses_render_area,
                       render_area_data = render_area.words, diag_seq = Common::DiagTrace::tl_draw_seq,
+                      // F5: capture the CONFIGURE-time frame like Draw/DescFinal;
+                      // CurrentFrame() at record-execution could be a later frame.
+                      diag_frame = texture_cache.FrameTick(),
                       diag_reused = diag_reused_allocation](vk::CommandBuffer cmdbuf) {
         Common::DiagTrace::Emit(Common::DiagTrace::Ev::DescRoute,
-                                Common::DiagTrace::CurrentFrame(), diag_seq,
+                                diag_frame, diag_seq,
                                 uses_descriptor_buffer ? 0 : uses_push_descriptor ? 1 : 2,
                                 num_descriptor_entries, diag_reused ? 1 : 0);
         if (bind_descriptor_buffer) {

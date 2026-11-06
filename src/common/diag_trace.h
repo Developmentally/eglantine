@@ -97,6 +97,11 @@ enum class Ev : u8 {
     HrwUpload,       // a=buffer_cpu_addr b=device_addr c=size (actual upload copy)
     Config,          // a=kind b/c/d=value; tag=name
     IdentitySnap,    // a=trace_obj b=slot c=gpu_addr d=state(0=live 1=deleted 2=dormant) tag=gen
+                     // taken at the FIRST in-window TickFrame (not necessarily the exact
+                     // window opening); deleted pre-window records are counted, not listed,
+                     // and their erase events are OUTSIDE the capture - the snapshot plus
+                     // the window does NOT give full lineage. Skip counters are cumulative
+                     // SINCE INIT, not window-only
     ImageDormant,    // a=trace_obj b=slot c=gpu_addr d=created_frame tag=encoded asid
     Count
 };

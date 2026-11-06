@@ -891,6 +891,27 @@ void TextureCache<P>::UpdateRenderTargets(bool is_clear) {
 
 template <class P>
 typename P::Framebuffer* TextureCache<P>::GetFramebuffer() {
+    // F1: tie a recorded draw to its render targets. Selected draws only
+    // (volume bound, same gate as full per-bind DescFinal); emitted at
+    // draw-configure RT resolution on both the cache-hit and the new path.
+    if (Common::DiagTrace::tl_selected_draw) {
+        Common::DiagTrace::Observe([&] {
+            for (size_t rt = 0; rt < NUM_RT; ++rt) {
+                const ImageViewId id = render_targets.color_buffer_ids[rt];
+                if (!id) {
+                    continue;
+                }
+                Common::DiagTrace::Emit(Common::DiagTrace::Ev::RTBind, frame_tick,
+                                        Common::DiagTrace::tl_draw_seq,
+                                        DiagTraceObjOf(slot_image_views[id].image_id), rt, 0);
+            }
+            if (const ImageViewId id = render_targets.depth_buffer_id) {
+                Common::DiagTrace::Emit(Common::DiagTrace::Ev::RTBind, frame_tick,
+                                        Common::DiagTrace::tl_draw_seq,
+                                        DiagTraceObjOf(slot_image_views[id].image_id), 0, 1);
+            }
+        });
+    }
     if (last_framebuffer_id && last_framebuffer_serial == render_targets_serial) {
         return &slot_framebuffers[last_framebuffer_id];
     }
@@ -2764,6 +2785,16 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
             Common::DiagTrace::Emit(Common::DiagTrace::Ev::RelatedEvict, frame_tick,
                                     dit->second.trace_obj, diag_trace_obj,
                                     dit->second.gpu_addr, 0, diag_evict_tag);
+        }
+        // F1 (CopyDep): the join-copy data dependency with real identity at
+        // both ends. NOTE: the review's BlitImage-layer emit is NOT done -
+        // that layer carries Vulkan handles, not texture-cache identities;
+        // this covers the texture-cache copy dependencies that have identity.
+        if (const auto dit = diag_images_.find(copy_object.id.index);
+            dit != diag_images_.end()) {
+            Common::DiagTrace::Emit(Common::DiagTrace::Ev::CopyDep, frame_tick,
+                                    dit->second.trace_obj, diag_trace_obj,
+                                    new_image.guest_size_bytes, 0);
         }
         if (copy_object.resize) {
             MakeDormant(copy_object.id);

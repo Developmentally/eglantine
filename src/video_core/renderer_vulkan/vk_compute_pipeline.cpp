@@ -329,6 +329,8 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
     scheduler.Record([this, descriptor_data, is_rescaling, descriptor_buffer_offset,
                       descriptor_buffer_chunk, bind_descriptor_buffer,
                       diag_seq = Common::DiagTrace::tl_draw_seq,
+                      // F5: configure-time frame (see graphics pipeline).
+                      diag_frame = texture_cache.FrameTick(),
                       rescaling_data = rescaling.Data()](vk::CommandBuffer cmdbuf) {
         if (bind_descriptor_buffer) {
             const VkDescriptorBufferBindingInfoEXT binding_info{
@@ -337,7 +339,7 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
         }
         if (!pipeline) {
             Common::DiagTrace::Emit(Common::DiagTrace::Ev::DescRoute,
-                                    Common::DiagTrace::CurrentFrame(), diag_seq, 255, 0, 0);
+                                    diag_frame, diag_seq, 255, 0, 0);
             return;
         }
         cmdbuf.BindPipeline(VK_PIPELINE_BIND_POINT_COMPUTE, *pipeline);
@@ -345,7 +347,7 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
             return;
         }
         Common::DiagTrace::Emit(Common::DiagTrace::Ev::DescRoute,
-                                Common::DiagTrace::CurrentFrame(), diag_seq,
+                                diag_frame, diag_seq,
                                 uses_descriptor_buffer ? 0 : uses_push_descriptor ? 1 : 2,
                                 num_descriptor_entries, 0);
         if (is_rescaling) {
