@@ -99,8 +99,10 @@ Limits you will hit on purpose:
   - The capture window defaults to everything. Instinct may ask you to set
     EDEN_NX2_TRACE_FROM_FRAME / EDEN_NX2_TRACE_TO_FRAME / EDEN_NX2_TRACE_DRAWS
     for a focused capture.
-  - Tracing overhead is UNMEASURED. If the game stutters more than usual,
-    that is the instrumentation, not a regression in your working build.
+  - Tracing overhead is UNMEASURED - we cannot say whether any extra stutter
+    comes from the instrumentation or from something else. If the game feels
+    different, note when and where and include that with the logs; it is
+    evidence, not a known regression in your working build.
   - The diagnostic build SHARES your Eden data folders (cache, saves, and the
     log at ~/.local/share/eden/log/eden_log.txt) with the working build.
     Sessions can add cache/save/log entries there, and the log is shared -

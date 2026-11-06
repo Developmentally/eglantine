@@ -53,10 +53,26 @@ if [ "${1:-}" = "--seed-from" ]; then
         rm -f "$tmp"
         die "seed copy from $src failed; the previous settings file is untouched and the seed marker is cleared - seed again before running"
     fi
-    src_hash="$(sha256sum "$src" | cut -d' ' -f1)"
-    dst_hash="$(sha256sum "$EGLANTINE_SETTINGS" | cut -d' ' -f1)"
-    echo "eglantine-test3: seeded settings from '$src' src-sha256=$src_hash dst-sha256=$dst_hash" | tee -a "$sessions" > "$receipt"
-    cat "$receipt" >&2
+    # Fail-closed receipt: every step must succeed, the hashes must MATCH, the
+    # evidence line must land in the sessions log BEFORE the marker exists, and
+    # the marker write itself must succeed. Any failure dies nonzero with no
+    # valid marker, so a broken seed can never permit a launch.
+    if ! src_hash="$(sha256sum -- "$src" | cut -d' ' -f1)" || [ -z "$src_hash" ]; then
+        die "could not hash the seed source '$src' - no marker written; fix the source and seed again"
+    fi
+    if ! dst_hash="$(sha256sum -- "$EGLANTINE_SETTINGS" | cut -d' ' -f1)" || [ -z "$dst_hash" ]; then
+        die "could not hash the freshly seeded settings file - no marker written; seed again before running"
+    fi
+    [ "$src_hash" = "$dst_hash" ] || \
+        die "seed hash mismatch (source $src_hash != installed $dst_hash) - the copy did not land intact; no marker written"
+    receipt_line="eglantine-test3: seeded settings from '$src' src-sha256=$src_hash dst-sha256=$dst_hash"
+    if ! printf '%s\n' "$receipt_line" >> "$sessions"; then
+        die "could not append the seed receipt to the sessions log '$sessions' - marker NOT written; fix the sessions log and seed again"
+    fi
+    if ! printf '%s\n' "$receipt_line" > "$receipt"; then
+        die "could not write the seed receipt marker '$receipt' - the evidence line is in the sessions log, but the marker is absent so the launcher stays fail-closed"
+    fi
+    printf '%s\n' "$receipt_line" >&2
     exit 0
 fi
 

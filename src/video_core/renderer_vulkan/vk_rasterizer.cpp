@@ -1014,9 +1014,15 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {
     }
 
     const auto report_failure = [&](std::string_view reason) {
-        Common::DiagTrace::Emit(Common::DiagTrace::Ev::DrawSkip, texture_cache.FrameTick(),
-                                Common::DiagTrace::tl_draw_seq, 0, 0, 0,
-                                std::string(reason).c_str());
+        // Under Observe the std::string temporary is constructed inside the
+        // wrapper: it is only built when tracing is enabled, and a throwing
+        // construction is contained and counted instead of escaping into the
+        // draw path. The d551 failure handling below stays outside on purpose.
+        Common::DiagTrace::Observe([&] {
+            Common::DiagTrace::Emit(Common::DiagTrace::Ev::DrawSkip, texture_cache.FrameTick(),
+                                    Common::DiagTrace::tl_draw_seq, 0, 0, 0,
+                                    std::string(reason).c_str());
+        });
         static std::set<std::tuple<u64, u64, std::string_view>> seen;
         const auto& regs = maxwell3d->regs;
         const u64 vs = (u64{regs.pipelines[1].reserved[0] & 0xff} << 32) | regs.pipelines[1].reserved[1];

@@ -684,6 +684,40 @@ TEST_CASE("DiagTrace isolation T7: init fault degrades to disabled, latches, nev
     REQUIRE(DT::S().init_runs.load() == 1); // no retry storm after the latch
 }
 
+// r33 (friend review): the DrawSkip call site in vk_rasterizer.cpp now builds
+// its tag via std::string(reason) INSIDE DiagTrace::Observe. These two cases
+// pin the API-boundary properties that call site relies on. They are boundary
+// semantics tests, NOT the literal rasterizer call site: that TU needs
+// libavcodec, so CI compiles it and the fixture never links it. (Per review:
+// a helper/pattern test is not actual call-site wiring proof.)
+TEST_CASE("DiagTrace boundary B1: disabled trace never runs the tag-building lambda",
+          "[trace-off]") {
+    unsigned constructed = 0;
+    const std::string_view reason = "no pipeline";
+    DT::Observe([&] {
+        ++constructed; // stands in for the std::string(reason) temporary
+        DT::Emit(Ev::DrawSkip, DT::CurrentFrame(), 0, 0, 0, 0, std::string(reason).c_str());
+    });
+    REQUIRE(constructed == 0); // lambda never ran: no temporary built while disabled
+}
+
+TEST_CASE("DiagTrace boundary B2: a fault before Emit is contained, counted, and emits nothing",
+          "[trace-on]") {
+    const u64 err0 = DT::S().observer_errors.load();
+    const u64 em0 = DT::S().emitted[static_cast<size_t>(Ev::DrawSkip)].load();
+    const bool armed = true; // not a constant expression: keeps the emit reachable to the compiler
+    const std::string_view reason = "no pipeline";
+    DT::Observe([&] {
+        const std::string tag(reason); // the call-site's temporary shape, for real
+        if (armed) {
+            throw std::bad_alloc{}; // stands in for the temporary's own throw (r32 gap shape)
+        }
+        DT::Emit(Ev::DrawSkip, DT::CurrentFrame(), 0, 0, 0, 0, tag.c_str());
+    });
+    REQUIRE(DT::S().observer_errors.load() - err0 == 1); // contained + counted
+    REQUIRE(DT::S().emitted[static_cast<size_t>(Ev::DrawSkip)].load() == em0); // no partial event
+}
+
 TEST_CASE("DiagTrace isolation T6: disabled trace never consults the hook", "[trace-off]") {
     GateProbe g;
     DT::TestArmFailNext(1);
