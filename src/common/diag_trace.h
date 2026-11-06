@@ -125,6 +125,23 @@ enum class Ev : u8 {
                      // file cap) are uncounted. Chunk flushes bound but never
                      // guarantee against loss; losses are counted, not prevented
     ImageDormant,    // a=trace_obj b=slot c=gpu_addr d=created_frame tag=encoded asid
+    ImageUpload,     // a=trace_obj (queue-time identity, checked again at completion)
+                     // b=0 c=layer count (by-layer route only, else 0) d=0 tag=route:
+                     // staging (full upload issued), by-layer, async-decode /
+                     // async-decode-superseded, zero-fill (synthetic zeros, NOT guest
+                     // data), unswizzle-queued / unswizzle-done / unswizzle-done-superseded
+                     // (-superseded: the slot's trace_obj changed between queue and
+                     // completion, so the slot was reused mid-decode - do not attribute
+                     // the completion to the queued object). ISSUE/QUEUE ONLY, never
+                     // GPU completion. Presence proves an upload was ISSUED at that
+                     // frame; ABSENCE DOES NOT prove never guest-populated (pre-window,
+                     // dropped events, observer/backend loss all produce silence).
+                     // Silent by design: unmodified early return, Unbacked (nothing to
+                     // upload into), MSAA without support, and sparse binding refresh
+                     // (RefreshSparseLayers updates bindings, no data copy - MKW's big
+                     // arrays are sparse, so silence there is expected, not missing
+                     // evidence). Byte counts stay with the images_uploaded /
+                     // uploaded_bytes aggregates; c is a layer count, never bytes
     Count
 };
 

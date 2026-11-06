@@ -68,6 +68,7 @@ struct ImageViewInOut {
 
 struct AsyncDecodeContext {
     ImageId image_id;
+    u64 trace_obj = 0; // diag only: queue-time trace identity, re-checked at completion
     Common::ScratchBuffer<u8> decoded_data;
     boost::container::small_vector<BufferImageCopy, 16> copies;
     std::mutex mutex;
@@ -217,6 +218,7 @@ class TextureCache : public VideoCommon::ChannelSetupCaches<TextureCacheChannelI
     struct PendingUnswizzle {
         ImageId image_id;
         VideoCommon::ImageInfo info;
+        u64 trace_obj = 0; // diag only: queue-time trace identity, re-checked at completion
         size_t current_offset = 0;
         size_t total_size = 0;
         AsyncBuffer staging_buffer;

@@ -1757,9 +1757,17 @@ void TextureCache<P>::RefreshContents(Image& image, ImageId image_id) {
         RefreshSparseLayers(image);
         return;
     }
-    if (!image.dirty_layers.empty() && UploadWrittenLayers(image)) {
-        runtime.InsertUploadMemoryBarrier();
-        return;
+    if (!image.dirty_layers.empty()) {
+        u64 dirty_count = 0; // diag only: counted BEFORE UploadWrittenLayers clears the vector
+        for (const u64 word : image.dirty_layers) {
+            dirty_count += static_cast<u64>(std::popcount(word));
+        }
+        if (UploadWrittenLayers(image)) {
+            Common::DiagTrace::Emit(Common::DiagTrace::Ev::ImageUpload, frame_tick,
+                                    DiagTraceObjOf(image_id), 0, dirty_count, 0, "by-layer");
+            runtime.InsertUploadMemoryBarrier();
+            return;
+        }
     }
     image.dirty_layers.clear();
 
@@ -1797,6 +1805,8 @@ void TextureCache<P>::RefreshContents(Image& image, ImageId image_id) {
     largest_upload = (std::max<u64>)(largest_upload, image.guest_size_bytes);
     auto staging = runtime.UploadStagingBuffer(MapSizeBytes(image));
     UploadImageContents(image, staging);
+    Common::DiagTrace::Emit(Common::DiagTrace::Ev::ImageUpload, frame_tick,
+                            DiagTraceObjOf(image_id), 0, 0, 0, "staging");
     runtime.InsertUploadMemoryBarrier();
 }
 
@@ -2195,6 +2205,7 @@ void TextureCache<P>::QueueAsyncDecode(Image& image, ImageId image_id) {
     auto decode = std::make_unique<AsyncDecodeContext>();
     auto* decode_ptr = decode.get();
     decode->image_id = image_id;
+    decode->trace_obj = DiagTraceObjOf(image_id); // diag: identity frozen at queue time
     async_decodes.push_back(std::move(decode));
 
     std::vector<u8> local_unswizzle_data_buffer(image.unswizzled_size_bytes, 0);
@@ -2211,6 +2222,8 @@ void TextureCache<P>::QueueAsyncDecode(Image& image, ImageId image_id) {
         auto staging = runtime.UploadStagingBuffer(out_size);
         std::memset(staging.mapped_span.data(), 0, out_size);
         image.UploadMemory(staging, zero_copies);
+        Common::DiagTrace::Emit(Common::DiagTrace::Ev::ImageUpload, frame_tick,
+                                DiagTraceObjOf(image_id), 0, 0, 0, "zero-fill");
         runtime.InsertUploadMemoryBarrier();
     }
 
@@ -2241,6 +2254,9 @@ void TextureCache<P>::QueueAsyncUnswizzle(Image& image, ImageId image_id) {
         .image_id = image_id,
         .info = image.info
     });
+    unswizzle_queue.back().trace_obj = DiagTraceObjOf(image_id); // diag: frozen at queue time
+    Common::DiagTrace::Emit(Common::DiagTrace::Ev::ImageUpload, frame_tick,
+                            unswizzle_queue.back().trace_obj, 0, 0, 0, "unswizzle-queued");
 }
 
 template <class P>
@@ -2274,6 +2290,11 @@ void TextureCache<P>::TickAsyncDecode() {
                     async_decode->decoded_data.size());
         image.UploadMemory(staging, async_decode->copies);
         image.flags &= ~ImageFlagBits::IsDecoding;
+        Common::DiagTrace::Emit(Common::DiagTrace::Ev::ImageUpload, frame_tick,
+                                async_decode->trace_obj, 0, 0, 0,
+                                async_decode->trace_obj == DiagTraceObjOf(async_decode->image_id)
+                                    ? "async-decode"
+                                    : "async-decode-superseded");
         has_uploads = true;
         i = async_decodes.erase(i);
     }
@@ -2352,6 +2373,11 @@ void TextureCache<P>::TickAsyncUnswizzle() {
     if (is_final_batch && all_slices_submitted) {
         runtime.FreeDeferredStagingBuffer(task.staging_buffer);
         image.flags &= ~ImageFlagBits::IsDecoding;
+        Common::DiagTrace::Emit(Common::DiagTrace::Ev::ImageUpload, frame_tick,
+                                task.trace_obj, 0, 0, 0,
+                                task.trace_obj == DiagTraceObjOf(task.image_id)
+                                    ? "unswizzle-done"
+                                    : "unswizzle-done-superseded");
         unswizzle_queue.pop_front();
 
         // Wait 4 frames to process the next entry
