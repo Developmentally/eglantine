@@ -175,6 +175,7 @@ class TextureCache : public VideoCommon::ChannelSetupCaches<TextureCacheChannelI
     // Bounded: at the cap, new inserts are skipped and counted (evidence, not lineage).
     std::unordered_map<u32, DiagImageRec> diag_images_;        // slot index -> record
     std::unordered_map<u32, u64> diag_view_gen_;               // view slot -> generation
+    u64 diag_view_next_gen_ = 0; // global monotonic; never reset or decremented (D6b)
     u64 diag_identity_skipped = 0;
     u64 diag_view_gen_skipped = 0; // view-gen entries dropped at the capacity bound
     bool diag_snapshot_done = false;
