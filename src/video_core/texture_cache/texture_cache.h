@@ -2290,11 +2290,21 @@ void TextureCache<P>::TickAsyncDecode() {
                     async_decode->decoded_data.size());
         image.UploadMemory(staging, async_decode->copies);
         image.flags &= ~ImageFlagBits::IsDecoding;
+        const char* up_tag; // diag: re-check the queue-time identity against the record
+        if (async_decode->trace_obj == 0) {
+            up_tag = "async-decode-unknown";
+        } else if (DiagImageStateOf(async_decode->image_id) < 0) {
+            up_tag = "async-decode-missing";
+        } else if (DiagImageStateOf(async_decode->image_id) == 1) {
+            up_tag = "async-decode-erased"; // guard: cancelled should have dropped it;
+                                            // if this fires, the cancel path missed
+        } else if (DiagTraceObjOf(async_decode->image_id) != async_decode->trace_obj) {
+            up_tag = "async-decode-superseded";
+        } else {
+            up_tag = "async-decode";
+        }
         Common::DiagTrace::Emit(Common::DiagTrace::Ev::ImageUpload, frame_tick,
-                                async_decode->trace_obj, 0, 0, 0,
-                                async_decode->trace_obj == DiagTraceObjOf(async_decode->image_id)
-                                    ? "async-decode"
-                                    : "async-decode-superseded");
+                                async_decode->trace_obj, 0, 0, 0, up_tag);
         has_uploads = true;
         i = async_decodes.erase(i);
     }
@@ -2373,11 +2383,21 @@ void TextureCache<P>::TickAsyncUnswizzle() {
     if (is_final_batch && all_slices_submitted) {
         runtime.FreeDeferredStagingBuffer(task.staging_buffer);
         image.flags &= ~ImageFlagBits::IsDecoding;
+        const char* up_tag; // diag: re-check the queue-time identity against the record
+        if (task.trace_obj == 0) {
+            up_tag = "unswizzle-submitted-unknown";
+        } else if (DiagImageStateOf(task.image_id) < 0) {
+            up_tag = "unswizzle-submitted-missing";
+        } else if (DiagImageStateOf(task.image_id) == 1) {
+            up_tag = "unswizzle-submitted-erased"; // pre-existing hazard: DeleteImage
+                                                   // never touches unswizzle_queue
+        } else if (DiagTraceObjOf(task.image_id) != task.trace_obj) {
+            up_tag = "unswizzle-submitted-superseded";
+        } else {
+            up_tag = "unswizzle-submitted"; // final batch ISSUED, not GPU-complete
+        }
         Common::DiagTrace::Emit(Common::DiagTrace::Ev::ImageUpload, frame_tick,
-                                task.trace_obj, 0, 0, 0,
-                                task.trace_obj == DiagTraceObjOf(task.image_id)
-                                    ? "unswizzle-done"
-                                    : "unswizzle-done-superseded");
+                                task.trace_obj, 0, 0, 0, up_tag);
         unswizzle_queue.pop_front();
 
         // Wait 4 frames to process the next entry

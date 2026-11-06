@@ -67,7 +67,7 @@ remaining=("$@")
 while [ ${#remaining[@]} -gt 0 ]; do
     case "${remaining[0]}" in
     --frames-ahead|--chunk-batch|--no-mesh|--windowed) remaining=("${remaining[@]:1}") ;;
-    --appimage) remaining=("${remaining[@]:2}") ;;
+    --appimage) die "--appimage is owned by this launcher (it selects 'eglantine test 3.AppImage'); passing your own would silently run a different binary" ;;
     --) break ;;
     -*) remaining=("${remaining[@]:1}") ;;
     *) [ -z "$game" ] && game="${remaining[0]}"; remaining=("${remaining[@]:1}") ;;
@@ -99,7 +99,8 @@ appimage="$here/eglantine test 3.AppImage"
 [ -f "$appimage" ] || die "'eglantine test 3.AppImage' is missing from $here"
 
 ini_hash_before="$(sha256sum "$EGLANTINE_SETTINGS" | cut -d' ' -f1)"
-echo "eglantine-test3: diagnostic capture (evidence only, not a fix); trace=$EDEN_NX2_TRACE draws=${EDEN_NX2_TRACE_DRAWS:-<all>} window=[${EDEN_NX2_TRACE_FROM_FRAME:-0},${EDEN_NX2_TRACE_TO_FRAME:-end}] settings=$(basename "$EGLANTINE_SETTINGS") sha256-before=$ini_hash_before" | tee -a "$sessions" >&2
+effective_env="$(env | grep '^EDEN_NX2_' | sort | tr '\n' ' ')"
+echo "eglantine-test3: diagnostic capture (evidence only, not a fix); settings=$(basename "$EGLANTINE_SETTINGS") sha256-before=$ini_hash_before env: $effective_env" | tee -a "$sessions" >&2
 
 "$here/eglantine-deck.sh" --appimage "$appimage" "$@"
 rc=$?
