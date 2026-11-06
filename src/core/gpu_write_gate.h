@@ -7,12 +7,12 @@
 //   - the seed (last_address = subaddress) happens BEFORE collect, as the original
 //   - a FALSE on_cpu_write returns before seeding and before collect
 //   - collect is unconditional once the page is seeded (the skip path)
-// The DiagTrace emissions are additive evidence capture with DISCLOSED observer
-// effects: they take the trace lock and can allocate/throw before collect runs;
-// the FIRST Emit in the process additionally runs one-time env/ring init under
-// std::call_once. All of this is disabled by default (EDEN_NX2_TRACE=1
-// enables). No allocation, retry, or write-handling behavior change to the
-// gated logic itself. Tests call this same function with the
+// The DiagTrace emissions are additive evidence capture, isolated from the
+// gated logic: Emit is noexcept with all observer work inside one try and the
+// catch limited to a noexcept counter increment, so a fault can never skip the
+// seed or collect below (faults are counted in observer_errors). All of this
+// is disabled by default (EDEN_NX2_TRACE=1 enables). No allocation, retry, or
+// write-handling behavior change to the gated logic itself. Tests call this same function with the
 // real BufferCache/GPUDirtyMemoryManager components behind the callables.
 
 #pragma once

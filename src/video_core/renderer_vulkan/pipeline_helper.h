@@ -391,12 +391,16 @@ inline void PushImageDescriptors(TextureCache& texture_cache,
                     diag_ovr = true;
                 }
             }
-            const u32 diag_flags = texture_cache.DiagImageFlagsOf(image_view.image_id);
-            if (Common::DiagTrace::Enabled() &&
-                (Common::DiagTrace::tl_selected_draw ||
-                 (diag_flags & (static_cast<u32>(VideoCommon::ImageFlagBits::Unbacked) |
-                                static_cast<u32>(VideoCommon::ImageFlagBits::UnwrittenSparse) |
-                                static_cast<u32>(VideoCommon::ImageFlagBits::ZeroFilled))) != 0)) {
+            // Observer-only containment; the flags lookup runs only when the
+            // master switch is on, inside the contained region.
+            Common::DiagTrace::Observe([&] {
+                const u32 diag_flags = texture_cache.DiagImageFlagsOf(image_view.image_id);
+                if (!Common::DiagTrace::tl_selected_draw &&
+                    (diag_flags & (static_cast<u32>(VideoCommon::ImageFlagBits::Unbacked) |
+                                   static_cast<u32>(VideoCommon::ImageFlagBits::UnwrittenSparse) |
+                                   static_cast<u32>(VideoCommon::ImageFlagBits::ZeroFilled))) == 0) {
+                    return;
+                }
                 // b always carries the ORIGINAL image's trace id; the final
                 // resource is identified by d (raw VkImageView) + the tag's
                 // final-kind char: k=kept original, n=null fallback, o=nx2 override.
@@ -415,7 +419,7 @@ inline void PushImageDescriptors(TextureCache& texture_cache,
                                         texture_cache.DiagTraceObjOf(image_view.image_id),
                                         image_view_id.index,
                                         std::bit_cast<u64>(vk_image_view), diag_tag);
-            }
+            });
             Sampler& sampler{texture_cache.GetSampler(sampler_id)};
             guest_descriptor_queue.AddSampledImage(vk_image_view,
                                                    sampler.HandleFor(image_view, desc.is_depth));
@@ -432,7 +436,17 @@ inline void PushImageDescriptors(TextureCache& texture_cache,
                 texture_cache.MarkModification(image_view.image_id);
             }
             const VkImageView vk_image_view{image_view.StorageView(desc.type, desc.format)};
-            if (Common::DiagTrace::Enabled() && Common::DiagTrace::tl_selected_draw) {
+            // Same flagged-event gate as the sampled path (F3): selected
+            // draws, or storage views of unbacked/unwritten-sparse/zero-filled
+            // images, record a DescFinal. Observer-only containment.
+            Common::DiagTrace::Observe([&] {
+                const u32 diag_flags = texture_cache.DiagImageFlagsOf(image_view.image_id);
+                if (!Common::DiagTrace::tl_selected_draw &&
+                    (diag_flags & (static_cast<u32>(VideoCommon::ImageFlagBits::Unbacked) |
+                                   static_cast<u32>(VideoCommon::ImageFlagBits::UnwrittenSparse) |
+                                   static_cast<u32>(VideoCommon::ImageFlagBits::ZeroFilled))) == 0) {
+                    return;
+                }
                 char diag_tag[48];
                 const int diag_len = std::snprintf(
                     diag_tag, sizeof(diag_tag), "s%u x%llx#%u ty%u g%llu storage%s", diag_stage,
@@ -449,7 +463,7 @@ inline void PushImageDescriptors(TextureCache& texture_cache,
                                         texture_cache.DiagTraceObjOf(image_view.image_id),
                                         (views - 1)->id.index,
                                         std::bit_cast<u64>(vk_image_view), diag_tag);
-            }
+            });
             guest_descriptor_queue.AddImage(vk_image_view);
             const bool element_rescaled{texture_cache.IsRescaling(image_view)};
             is_rescaled |= element_rescaled;

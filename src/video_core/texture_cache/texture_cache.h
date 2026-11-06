@@ -500,17 +500,20 @@ void TextureCache<P>::TickFrame() {
     if (Common::DiagTrace::Enabled() && !diag_snapshot_done &&
         Common::DiagTrace::InWindow(frame_tick)) {
         // Pre-window identity snapshot: the live table state when capture begins.
-        diag_snapshot_done = true;
-        for (const auto& [slot, rec] : diag_images_) {
-            char diag_tag[16];
-            std::snprintf(diag_tag, sizeof(diag_tag), "gen%u", rec.generation);
-            Common::DiagTrace::Emit(Common::DiagTrace::Ev::IdentitySnap, frame_tick,
-                                    rec.trace_obj, slot, rec.gpu_addr, rec.state, diag_tag);
-        }
-        Common::DiagTrace::Emit(Common::DiagTrace::Ev::Config, frame_tick,
-                                diag_images_.size(), diag_identity_skipped,
-                                diag_view_gen_.size(), diag_view_gen_skipped,
-                                "identity-snapshot-done");
+        // Observer-only containment: a fault here can never escape TickFrame.
+        Common::DiagTrace::Observe([&] {
+            diag_snapshot_done = true;
+            for (const auto& [slot, rec] : diag_images_) {
+                char diag_tag[16];
+                std::snprintf(diag_tag, sizeof(diag_tag), "gen%u", rec.generation);
+                Common::DiagTrace::Emit(Common::DiagTrace::Ev::IdentitySnap, frame_tick,
+                                        rec.trace_obj, slot, rec.gpu_addr, rec.state, diag_tag);
+            }
+            Common::DiagTrace::Emit(Common::DiagTrace::Ev::Config, frame_tick,
+                                    diag_images_.size(), diag_identity_skipped,
+                                    diag_view_gen_.size(), diag_view_gen_skipped,
+                                    "identity-snapshot-done");
+        });
     }
 
     if constexpr (IMPLEMENTS_ASYNC_DOWNLOADS) {
@@ -2476,9 +2479,10 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
         revived_id ? revived_id : slot_images.insert(runtime, new_info, gpu_addr, cpu_addr);
     Image& new_image = slot_images[new_image_id];
     u64 diag_trace_obj = 0;
-    if (Common::DiagTrace::Enabled()) {
-        // Diagnostic identity tracking only; skipped entirely when the master
-        // switch is off (no allocations, no map inserts, no formatting).
+    // Diagnostic identity tracking only; skipped entirely when the master
+    // switch is off, and fault-contained (map inserts can allocate/throw) so
+    // an observer fault can never escape into image creation.
+    Common::DiagTrace::Observe([&] {
         if (revived_id) {
         // Same slot object revived: keep its trace identity, bump the generation.
         if (auto dit = diag_images_.find(new_image_id.index); dit != diag_images_.end()) {
@@ -2518,7 +2522,7 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
                                 diag_trace_obj, new_image_id.index, gpu_addr,
                                 new_image.guest_size_bytes, diag_shape);
         }
-    }
+    });
 
     new_image.allocation_tick = frame_tick;
     if (!revived_id) {
@@ -3265,15 +3269,15 @@ ImageViewId TextureCache<P>::FindOrEmplaceImageView(ImageId image_id, const Imag
     }
     const ImageViewId image_view_id = slot_image_views.insert(runtime, info, image_id, image, slot_images);
     u64 diag_vgen = 0;
-    if (Common::DiagTrace::Enabled()) {
-        // Bounded like the image identity map: existing keys always update;
-        // new keys beyond the cap are skipped and counted.
+    // Bounded like the image identity map: existing keys always update;
+    // new keys beyond the cap are skipped and counted. Fault-contained.
+    Common::DiagTrace::Observe([&] {
         if (diag_view_gen_.size() < 262144 || diag_view_gen_.contains(image_view_id.index)) {
             diag_vgen = ++diag_view_gen_[image_view_id.index];
         } else {
             ++diag_view_gen_skipped;
         }
-    }
+    });
     Common::DiagTrace::Emit(Common::DiagTrace::Ev::ViewCreate, frame_tick,
                             image_view_id.index, DiagTraceObjOf(image_id), diag_vgen,
                             static_cast<u64>(info.type));

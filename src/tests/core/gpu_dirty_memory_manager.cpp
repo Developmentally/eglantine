@@ -433,3 +433,145 @@ TEST_CASE("Criterion2 chain: first write to guest page 0 takes the skip path "
     REQUIRE(collect_calls == 1);
     REQUIRE(HasRange(GatherAll(manager), 0, 64));
 }
+
+// ---------------------------------------------------------------------------
+// DiagTrace observer-failure isolation (R1-R6/G1-G4 review items).
+// These tests exercise the ACTUAL production header via compile-only hooks
+// (EDEN_NX2_TRACE_TEST_HOOKS, defined for the fixture build only). The
+// catch-all paths they exercise are always compiled.
+// ReadEnvOnce latches per process, so the build script runs three tagged
+// batches: [trace-init-fail] (own process, init-fail env), [trace-on]
+// (EDEN_NX2_TRACE=1), [trace-off] with [gpu_dirty] (no trace env).
+// ---------------------------------------------------------------------------
+
+// T5 (compile time): the isolation surface is noexcept by contract.
+static_assert(noexcept(Common::DiagTrace::Emit(Common::DiagTrace::Ev::Config, 0, 0, 0, 0,0,"")));
+static_assert(noexcept(Common::DiagTrace::Flush(0, "t")));
+static_assert(noexcept(Common::DiagTrace::TickFlush(0)));
+static_assert(noexcept(Common::DiagTrace::Enabled()));
+static_assert(noexcept(Common::DiagTrace::BeginDraw(0, std::declval<u64&>())));
+static_assert(std::is_nothrow_default_constructible_v<Common::DiagTrace::State>);
+
+namespace {
+using Common::DiagTrace::Ev;
+namespace DT = Common::DiagTrace;
+
+struct GateProbe {
+    u64 last = 0; // production zero-init (memory.cpp GPUDirtyState value-init)
+    unsigned oncpu = 0;
+    unsigned collects = 0;
+    auto OnCpu() { return [this](u64, u64) { ++oncpu; return true; }; }
+    auto Collect() { return [this](u64, u64) { ++collects; }; }
+};
+constexpr u64 kTracePage = 0x400000; // nonzero page, well above page 0
+} // namespace
+
+TEST_CASE("DiagTrace isolation T1: emit fault before collect is contained (fresh page, seed kept)",
+          "[trace-on]") {
+    GateProbe g;
+    const u64 err0 = DT::S().observer_errors.load();
+    DT::TestArmFailNext(1); // next enabled emit (HrwSeed) throws
+    Core::HandleRasterizerWriteGate(g.last, kTracePage, kTracePage, 64, 0, g.OnCpu(), g.Collect());
+    REQUIRE(g.last == kTracePage); // seed happened despite the throwing emit
+    REQUIRE(g.oncpu == 1);
+    REQUIRE(g.collects == 1); // collect still ran exactly once
+    REQUIRE(DT::S().observer_errors.load() - err0 == 1); // contained + counted
+}
+
+TEST_CASE("DiagTrace isolation T2: skip-path emit fault is contained (pre-seeded page)",
+          "[trace-on]") {
+    GateProbe g;
+    g.last = kTracePage; // pre-seeded
+    const u64 err0 = DT::S().observer_errors.load();
+    DT::TestArmFailNext(1); // HrwSkip throws
+    Core::HandleRasterizerWriteGate(g.last, kTracePage, kTracePage, 64, 0, g.OnCpu(), g.Collect());
+    REQUIRE(g.oncpu == 0); // skip path never calls OnCPUWrite
+    REQUIRE(g.collects == 1); // collect still ran
+    REQUIRE(DT::S().observer_errors.load() - err0 == 1);
+}
+
+TEST_CASE("DiagTrace isolation T3: collect-report emit fault is contained (pre-seeded page)",
+          "[trace-on]") {
+    GateProbe g;
+    g.last = kTracePage;
+    const u64 err0 = DT::S().observer_errors.load();
+    DT::TestArmFailNext(1, 1); // let HrwSkip pass; HrwCollect throws (it precedes collect())
+    Core::HandleRasterizerWriteGate(g.last, kTracePage, kTracePage, 64, 0, g.OnCpu(), g.Collect());
+    REQUIRE(g.collects == 1); // collect still ran exactly once
+    REQUIRE(DT::S().observer_errors.load() - err0 == 1);
+}
+
+TEST_CASE("DiagTrace isolation T4: both emits faulting still collect exactly once", "[trace-on]") {
+    GateProbe g;
+    const u64 err0 = DT::S().observer_errors.load();
+    DT::TestArmFailNext(2); // HrwSeed and HrwCollect both throw
+    Core::HandleRasterizerWriteGate(g.last, kTracePage, kTracePage, 64, 0, g.OnCpu(), g.Collect());
+    REQUIRE(g.last == kTracePage);
+    REQUIRE(g.collects == 1);
+    REQUIRE(DT::S().observer_errors.load() - err0 == 2);
+}
+
+TEST_CASE("DiagTrace isolation T8: flush fault is counted and latches the fail-safe",
+          "[trace-on]") {
+    const u64 err0 = DT::S().observer_errors.load();
+    REQUIRE(!DT::S().flush_broken.load());
+    DT::TestArmFailNext(1);
+    DT::Flush(DT::CurrentFrame(), "t8");
+    REQUIRE(DT::S().observer_errors.load() - err0 == 1);
+    REQUIRE(DT::S().flush_broken.load()); // fail-safe: no more attempts
+    DT::Flush(DT::CurrentFrame(), "t8b"); // early-returns: no throw, no new error
+    REQUIRE(DT::S().observer_errors.load() - err0 == 1);
+    DT::S().flush_broken.store(false); // leave the process clean for later tests
+}
+
+TEST_CASE("DiagTrace isolation T9: post-halt arrivals count late_after_halt only", "[trace-on]") {
+    const u64 late0 = DT::S().late_after_halt.load();
+    const u64 em0 = DT::S().emitted[static_cast<size_t>(Ev::HrwSkip)].load();
+    DT::S().capture_halted.store(true);
+    for (int k = 0; k < 3; ++k) {
+        DT::Emit(Ev::HrwSkip, DT::CurrentFrame(), 0, kTracePage, kTracePage, 64);
+    }
+    REQUIRE(DT::S().late_after_halt.load() - late0 == 3);
+    REQUIRE(DT::S().emitted[static_cast<size_t>(Ev::HrwSkip)].load() == em0); // unchanged
+    DT::S().capture_halted.store(false);
+}
+
+TEST_CASE("DiagTrace isolation T10: Observe() contains call-site faults; outside state advances",
+          "[trace-on]") {
+    const u64 err0 = DT::S().observer_errors.load();
+    unsigned adjacent = 0;
+    DT::Observe([&] { throw std::bad_alloc{}; });
+    ++adjacent; // state OUTSIDE the lambda still advances
+    REQUIRE(adjacent == 1);
+    REQUIRE(DT::S().observer_errors.load() - err0 == 1);
+}
+
+TEST_CASE("DiagTrace isolation T7: init fault degrades to disabled, latches, never retries",
+          "[trace-init-fail]") {
+    // Ran in its own process with EDEN_NX2_TRACE=1 and
+    // EDEN_NX2_TRACE_TEST_FAIL_INIT=1 (build script sets both).
+    REQUIRE(!DT::Enabled()); // the init fault forced disabled
+    REQUIRE(DT::S().init_runs.load() == 1); // init body ran exactly once
+    REQUIRE(DT::S().observer_errors.load() >= 1);
+    DT::Emit(Ev::Config, 0, 0, 0, 0, 0, "t7");
+    DT::Emit(Ev::Config, 0, 0, 0, 0, 0, "t7");
+    REQUIRE(DT::S().init_runs.load() == 1); // no retry storm after the latch
+}
+
+TEST_CASE("DiagTrace isolation T6: disabled trace never consults the hook", "[trace-off]") {
+    GateProbe g;
+    DT::TestArmFailNext(1);
+    Core::HandleRasterizerWriteGate(g.last, kTracePage, kTracePage, 64, 0, g.OnCpu(), g.Collect());
+    REQUIRE(g.collects == 1); // gate behaves exactly as without the hook
+    REQUIRE(DT::S().test_fail_next.load() == 1); // hook armed but never consulted
+    DT::S().test_fail_next.store(0);
+}
+
+TEST_CASE("GPUDirtyMemoryManager gate T11: size==0 on a fresh nonzero page neither seeds nor "
+          "collects", "[trace-off]") {
+    GateProbe g;
+    Core::HandleRasterizerWriteGate(g.last, kTracePage, kTracePage, 0, 0, g.OnCpu(), g.Collect());
+    REQUIRE(g.oncpu == 0); // (address != 0 && size != 0) short-circuits first
+    REQUIRE(g.collects == 0);
+    REQUIRE(g.last == 0); // unseeded
+}
