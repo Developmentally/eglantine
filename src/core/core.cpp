@@ -25,6 +25,7 @@
 #include "core/debugger/debugger.h"
 #include "core/device_memory.h"
 #include "core/file_sys/fs_filesystem.h"
+#include "core/file_sys/nup_container.h"
 #include "core/file_sys/patch_manager.h"
 #include "core/file_sys/program_metadata.h"
 #include "core/file_sys/registered_cache.h"
@@ -116,9 +117,31 @@ namespace {
 
 // Switch 2 titles boot as a loose ExeFS, with main.npdm next to main.
 bool IsSwitch2Program(const FileSys::VirtualFile& file) {
+    FileSys::ProgramMetadata metadata;
+    if (FileSys::NupContainer::IsNupFile(file)) {
+        FileSys::NupContainer nup{file};
+        if (nup.GetStatus() != Loader::ResultStatus::Success) {
+            return false;
+        }
+        // Mirror AppLoader_NUP selection (loader/nup.cpp): with a usable base ExeFS the
+        // booted ExeFS is the newest usable update's, otherwise the base's; a standalone
+        // update boots itself. Reading the npdm from the booted ExeFS keeps the Switch 2
+        // check consistent with what will actually run.
+        const auto base = nup.FindBasePackage();
+        const auto update = nup.FindBestUpdatePackage();
+        std::optional<std::size_t> exefs_index;
+        if (base && nup.GetExeFSDir(*base) != nullptr) {
+            exefs_index = update && nup.GetExeFSDir(*update) != nullptr ? update : base;
+        } else if (update && nup.GetExeFSDir(*update) != nullptr) {
+            exefs_index = update;
+        }
+        const auto exefs = exefs_index ? nup.GetExeFSDir(*exefs_index) : nullptr;
+        const auto npdm = exefs != nullptr ? exefs->GetFile("main.npdm") : nullptr;
+        return npdm != nullptr && metadata.Load(npdm) == Loader::ResultStatus::Success &&
+               metadata.IsSwitch2();
+    }
     const auto dir = file != nullptr ? file->GetContainingDirectory() : nullptr;
     const auto npdm = dir != nullptr ? dir->GetFile("main.npdm") : nullptr;
-    FileSys::ProgramMetadata metadata;
     return npdm != nullptr && metadata.Load(npdm) == Loader::ResultStatus::Success &&
            metadata.IsSwitch2();
 }
